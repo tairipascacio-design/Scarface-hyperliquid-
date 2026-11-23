@@ -1,0 +1,6 @@
+{
+  "name": "HyperLiquid AI Pro - Autonomous Web3 Perps Terminal",
+  "description": "Plataforma de trading Web3 para futuros perpetuos en Hyperliquid con motor de IA autónomo con botón ON/OFF, aprendizaje continuo en base de datos, chat con IA Pro Master, exportador de reportes profesionales y wallet on-chain con transferencias.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
