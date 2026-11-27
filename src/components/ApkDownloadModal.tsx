@@ -29,6 +29,8 @@ interface ApkMeta {
   fileSizeBytes: number;
   fileSizeFormatted: string;
   sha256: string;
+  sourceHash?: string;
+  builtAt?: string;
   minSdk: string;
   targetSdk: string;
   arch: string;
@@ -53,7 +55,7 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
 
   const mobileQrDownloadUrl =
     typeof window !== 'undefined' && !runningInsideApk
-      ? `${window.location.origin}/api/download/apk`
+      ? `${window.location.origin}/api/download/apk?fresh=1`
       : 'file:///android_asset/www/index.html';
 
   useEffect(() => {
@@ -61,11 +63,11 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
 
     if (runningInsideApk) {
       setApkInfo({
-        version: '2.5.0-PRO',
-        versionCode: 20500,
+        version: '2.6.0-PRO',
+        versionCode: 20600,
         appName: 'HyperLiquid Pro L1 Terminal',
         packageName: 'com.hyperliquid.scarface.l1',
-        filename: 'HyperLiquid-Pro-L1-v2.5.apk',
+        filename: 'HyperLiquid-Pro-L1-v2.6.apk',
         fileSizeBytes: 0,
         fileSizeFormatted: 'Instalada en Android',
         sha256: 'APK_STANDALONE_VERIFICADA',
@@ -81,11 +83,11 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
       return;
     }
 
-    fetch('/api/apk/info', { credentials: 'include' })
+    fetch(`/api/apk/info?t=${Date.now()}`, { credentials: 'include', cache: 'no-store' })
       .then((res) => res.json())
       .then((data: ApkMeta) => {
         setApkInfo(data);
-        const downloadUrl = `${window.location.origin}/api/download/apk`;
+        const downloadUrl = `${window.location.origin}/api/download/apk?fresh=1&v=${encodeURIComponent(data.sourceHash || String(Date.now()))}`;
         QRCode.toDataURL(downloadUrl, {
           width: 260,
           margin: 1.5,
@@ -131,8 +133,12 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
 
     try {
       let downloaded = false;
+      const cacheBust = `fresh=1&t=${Date.now()}`;
       try {
-        const res = await fetch('/api/apk/bundle', { credentials: 'include' });
+        const res = await fetch(`/api/apk/bundle?${cacheBust}`, {
+          credentials: 'include',
+          cache: 'no-store',
+        });
         if (res.ok) {
           setDownloadProgress(65);
           const data = await res.json();
@@ -145,8 +151,20 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
             const blob = new Blob([bytes], {
               type: data.mimeType || 'application/vnd.android.package-archive',
             });
+            setApkInfo((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    sha256: data.sha256 || prev.sha256,
+                    sourceHash: data.sourceHash || prev.sourceHash,
+                    builtAt: data.builtAt || prev.builtAt,
+                    version: data.version || prev.version,
+                    filename: data.filename || prev.filename,
+                  }
+                : prev
+            );
             setDownloadProgress(95);
-            triggerBlobDownload(blob, data.filename || 'HyperLiquid-Pro-L1-v2.5.apk');
+            triggerBlobDownload(blob, data.filename || 'HyperLiquid-Pro-L1-v2.6.apk');
             downloaded = true;
           }
         }
@@ -156,13 +174,16 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
 
       if (!downloaded) {
         setDownloadProgress(55);
-        const binRes = await fetch('/api/download/apk', { credentials: 'include' });
+        const binRes = await fetch(`/api/download/apk?${cacheBust}`, {
+          credentials: 'include',
+          cache: 'no-store',
+        });
         if (!binRes.ok) {
           throw new Error(`HTTP ${binRes.status}: No se pudo descargar el binario APK.`);
         }
         const blob = await binRes.blob();
         setDownloadProgress(95);
-        triggerBlobDownload(blob, apkInfo?.filename || 'HyperLiquid-Pro-L1-v2.5.apk');
+        triggerBlobDownload(blob, apkInfo?.filename || 'HyperLiquid-Pro-L1-v2.6.apk');
       }
 
       setDownloadProgress(100);
@@ -194,7 +215,7 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
                   DESCARGAR APK ANDROID
                 </h3>
                 <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                  {apkInfo?.version || 'v2.5.0-PRO'}
+                  {apkInfo?.version || 'v2.6.0-PRO'}
                 </span>
                 <span className="px-2 py-0.5 rounded text-[10px] font-mono font-black bg-emerald-950 text-emerald-300 border border-emerald-500/50">
                   OFICIAL L1
@@ -258,20 +279,20 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
               <div className="bg-gradient-to-r from-[#1b120c] via-[#24150d] to-[#170e0a] border border-amber-500/30 p-4 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4">
                 <div className="space-y-1 text-center sm:text-left">
                   <div className="text-white font-bold text-sm flex items-center justify-center sm:justify-start space-x-2">
-                    <span>{apkInfo?.filename || 'HyperLiquid-Pro-L1-v2.5.apk'}</span>
+                    <span>{apkInfo?.filename || 'HyperLiquid-Pro-L1-v2.6.apk'}</span>
                     <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-black">
                       APK
                     </span>
                   </div>
                   <p className="text-[11px] text-zinc-400">
-                    APK autónoma con toda la terminal, gráficas, firma EIP-712 y motores Hyperliquid L1 embebidos dentro del paquete (cero errores 404).
+                    APK compilada en vivo desde este preview actual (terminales, voz nativa, ZEC/BTC sweep, margin aislado y motores Hyperliquid L1).
                   </p>
                   <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 pt-1 text-[10px] text-zinc-400">
                     <span className="bg-black/60 px-2 py-0.5 rounded border border-white/5">
-                      Tamaño: <strong className="text-white">{apkInfo?.fileSizeFormatted || '~280 KB'}</strong>
+                      Tamaño: <strong className="text-white">{apkInfo?.fileSizeFormatted || '~320 KB'}</strong>
                     </span>
                     <span className="bg-black/60 px-2 py-0.5 rounded border border-white/5">
-                      Arquitectura: <strong className="text-amber-300">Universal ARM64 / x86</strong>
+                      Build Preview: <strong className="text-amber-300">{apkInfo?.sourceHash || 'LIVE'}</strong>
                     </span>
                     <span className="bg-black/60 px-2 py-0.5 rounded border border-white/5">
                       Android: <strong className="text-emerald-400">8.0 o superior</strong>
@@ -415,7 +436,7 @@ export const ApkDownloadModal: React.FC<ApkDownloadModalProps> = ({ isOpen, onCl
                 </div>
                 <div className="p-2.5 bg-black/60 border border-white/5 rounded-lg flex justify-between gap-2">
                   <span className="text-zinc-500">Versión:</span>
-                  <span className="text-white font-mono font-bold">{apkInfo?.version || '2.5.0-PRO'} (Build {apkInfo?.versionCode || 20500})</span>
+                  <span className="text-white font-mono font-bold">{apkInfo?.version || '2.6.0-PRO'} (Build {apkInfo?.versionCode || 20600})</span>
                 </div>
                 <div className="p-2.5 bg-black/60 border border-white/5 rounded-lg flex justify-between gap-2">
                   <span className="text-zinc-500">Mínimo SDK:</span>

@@ -5,7 +5,13 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
-import { buildGenuineAndroidApkAsync, prewarmStandaloneApk } from './apkBuilder';
+import {
+  APK_FILENAME,
+  APK_VERSION,
+  APK_VERSION_CODE,
+  buildGenuineAndroidApkAsync,
+  prewarmStandaloneApk,
+} from './apkBuilder';
 
 dotenv.config();
 
@@ -270,14 +276,19 @@ async function startServer() {
   // Direct Android APK Download Routes (Compiled AXML + DEX 035 + Embedded WWW Bundle + v1/v2 Signed)
   app.get(['/api/download/apk', '/download/HyperLiquid-Pro.apk'], async (req, res) => {
     try {
-      const { buffer, sha256, signerSha256 } = await buildGenuineAndroidApkAsync(resolveApkLaunchUrl(req));
+      const forceRebuild = req.query.fresh === '1' || req.query.fresh === 'true';
+      const { buffer, sha256, signerSha256, sourceHash } = await buildGenuineAndroidApkAsync(
+        resolveApkLaunchUrl(req),
+        forceRebuild
+      );
       res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-      res.setHeader('Content-Disposition', 'attachment; filename="HyperLiquid-Pro-L1-v2.5.apk"');
+      res.setHeader('Content-Disposition', `attachment; filename="${APK_FILENAME}"`);
       res.setHeader('Content-Length', buffer.length);
       res.setHeader('X-APK-SHA256', sha256);
       res.setHeader('X-APK-Signer-SHA256', signerSha256);
-      res.setHeader('X-APK-Version', '2.5.0-PRO');
-      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-APK-Version', APK_VERSION);
+      res.setHeader('X-APK-Source-Hash', sourceHash);
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.send(buffer);
     } catch (err: any) {
       console.error('APK build error:', err);
@@ -288,17 +299,24 @@ async function startServer() {
   // APK Meta Information Route
   app.get('/api/apk/info', async (req, res) => {
     try {
-      const { buffer, sha256, signerSha256, appUrl } = await buildGenuineAndroidApkAsync(resolveApkLaunchUrl(req));
+      const forceRebuild = req.query.fresh === '1' || req.query.fresh === 'true';
+      const { buffer, sha256, signerSha256, appUrl, sourceHash, builtAt } = await buildGenuineAndroidApkAsync(
+        resolveApkLaunchUrl(req),
+        forceRebuild
+      );
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.json({
-        version: '2.5.0-PRO',
-        versionCode: 20500,
+        version: APK_VERSION,
+        versionCode: APK_VERSION_CODE,
         appName: 'HyperLiquid Pro L1 Terminal',
         packageName: 'com.hyperliquid.scarface.l1',
-        filename: 'HyperLiquid-Pro-L1-v2.5.apk',
+        filename: APK_FILENAME,
         fileSizeBytes: buffer.length,
         fileSizeFormatted: `${(buffer.length / 1024).toFixed(1)} KB`,
         sha256,
         signerSha256,
+        sourceHash,
+        builtAt,
         launchUrl: appUrl,
         minSdk: 'Android 8.0 (API Level 26+)',
         targetSdk: 'Android 14 (API Level 34)',
@@ -307,7 +325,7 @@ async function startServer() {
         binaryFormat: 'Binary AXML + DEX 035 + Bundle React/L1 Embebido (assets/www)',
         downloadUrl: '/api/download/apk',
         directUrl: '/download/HyperLiquid-Pro.apk',
-        releasedAt: new Date().toISOString(),
+        releasedAt: builtAt,
       });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Failed to read APK info' });
@@ -317,14 +335,21 @@ async function startServer() {
   // Iframe-safe APK Bundle Route (prevents Cloud Run Preview 401/403 on navigation downloads)
   app.get('/api/apk/bundle', async (req, res) => {
     try {
-      const { buffer, sha256, signerSha256, sizeBytes } = await buildGenuineAndroidApkAsync(resolveApkLaunchUrl(req));
-      res.setHeader('Cache-Control', 'no-store');
+      const forceRebuild = req.query.fresh === '1' || req.query.fresh === 'true';
+      const { buffer, sha256, signerSha256, sizeBytes, sourceHash, builtAt } = await buildGenuineAndroidApkAsync(
+        resolveApkLaunchUrl(req),
+        forceRebuild
+      );
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.json({
-        filename: 'HyperLiquid-Pro-L1-v2.5.apk',
+        filename: APK_FILENAME,
         mimeType: 'application/vnd.android.package-archive',
-        version: '2.5.0-PRO',
+        version: APK_VERSION,
+        versionCode: APK_VERSION_CODE,
         sha256,
         signerSha256,
+        sourceHash,
+        builtAt,
         sizeBytes,
         base64: buffer.toString('base64'),
       });

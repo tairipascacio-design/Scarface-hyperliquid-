@@ -114,6 +114,10 @@ interface AxmlNode {
   children: AxmlNode[];
 }
 
+export const APK_VERSION = '2.6.0-PRO';
+export const APK_VERSION_CODE = 20600;
+export const APK_FILENAME = 'HyperLiquid-Pro-L1-v2.6.apk';
+
 export function buildBinaryAndroidManifest(): Buffer {
   // Resource attributes mapped 1:1 at the start of the string pool
   const frameworkAttrs: Array<[string, number]> = [
@@ -135,8 +139,8 @@ export function buildBinaryAndroidManifest(): Buffer {
     line: 2,
     attrs: [
       { androidNs: false, name: 'package', dataType: 0x03, valueStr: 'com.hyperliquid.scarface.l1' },
-      { androidNs: true, name: 'versionCode', dataType: 0x10, valueInt: 20500 },
-      { androidNs: true, name: 'versionName', dataType: 0x03, valueStr: '2.5.0-PRO' },
+      { androidNs: true, name: 'versionCode', dataType: 0x10, valueInt: APK_VERSION_CODE },
+      { androidNs: true, name: 'versionName', dataType: 0x03, valueStr: APK_VERSION },
     ],
     children: [
       {
@@ -1670,6 +1674,8 @@ export interface BuiltApkArtifact {
   signerSha256: string;
   sizeBytes: number;
   appUrl: string;
+  sourceHash: string;
+  builtAt: string;
 }
 
 const apkCacheByUrl = new Map<string, BuiltApkArtifact>();
@@ -1680,10 +1686,40 @@ interface EmbeddedWebAssets {
   indexHtml: Buffer;
   appJs: Buffer;
   appCss: Buffer;
+  sourceHash: string;
+  builtAt: string;
 }
 
 let cachedWebAssets: EmbeddedWebAssets | null = null;
 let webAssetsBuildPromise: Promise<EmbeddedWebAssets> | null = null;
+
+function computeLiveSourceFingerprint(): string {
+  const root = process.cwd();
+  const hash = crypto.createHash('sha256');
+  const walk = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else {
+        const st = fs.statSync(fullPath);
+        hash.update(`${path.relative(root, fullPath)}:${st.size}:${Math.floor(st.mtimeMs)}\n`);
+      }
+    }
+  };
+  walk(path.join(root, 'src'));
+  for (const singleFile of ['index.html', 'package.json', 'vite.config.ts', 'apkBuilder.ts']) {
+    const p = path.join(root, singleFile);
+    if (fs.existsSync(p)) {
+      const st = fs.statSync(p);
+      hash.update(`${singleFile}:${st.size}:${Math.floor(st.mtimeMs)}\n`);
+    }
+  }
+  return hash.digest('hex').slice(0, 12);
+}
 
 function buildApkIndexHtml(apiBaseUrl?: string): Buffer {
   const cleanApiBase = (apiBaseUrl || '').replace(/\/+$/, '');
@@ -1693,6 +1729,9 @@ function buildApkIndexHtml(apiBaseUrl?: string): Buffer {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>HyperLiquid Pro L1</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <script>window.__HL_ANDROID_APK__=true;window.__HL_NATIVE_TTS_BRIDGE__=true;window.__HL_API_BASE_URL__=${JSON.stringify(cleanApiBase)};</script>
     <link rel="stylesheet" href="./app.css" />
     <script defer src="./app.js"></script>
@@ -1705,8 +1744,14 @@ function buildApkIndexHtml(apiBaseUrl?: string): Buffer {
   return Buffer.from(indexHtmlStr, 'utf8');
 }
 
-async function buildStandaloneWebBundle(): Promise<EmbeddedWebAssets> {
-  if (cachedWebAssets) return cachedWebAssets;
+async function buildStandaloneWebBundle(forceRebuild: boolean = false): Promise<EmbeddedWebAssets> {
+  const liveFingerprint = computeLiveSourceFingerprint();
+  if (!forceRebuild && cachedWebAssets && cachedWebAssets.sourceHash === liveFingerprint) {
+    return cachedWebAssets;
+  }
+  if (cachedWebAssets && cachedWebAssets.sourceHash !== liveFingerprint) {
+    standaloneApkCache.clear();
+  }
   if (webAssetsBuildPromise) return webAssetsBuildPromise;
 
   webAssetsBuildPromise = (async () => {
@@ -1719,19 +1764,25 @@ async function buildStandaloneWebBundle(): Promise<EmbeddedWebAssets> {
           outDir: tmpOutDir,
           emptyOutDir: true,
           modulePreload: { polyfill: false },
+          cssCodeSplit: false,
+          rollupOptions: {
+            output: {
+              inlineDynamicImports: true,
+            },
+          },
         },
       });
 
       const assetsDir = path.join(tmpOutDir, 'assets');
       const assetFiles = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
-      const jsFile = assetFiles.find((f) => f.endsWith('.js'));
-      const cssFiles = assetFiles.filter((f) => f.endsWith('.css'));
+      const jsFiles = assetFiles.filter((f) => f.endsWith('.js')).sort();
+      const cssFiles = assetFiles.filter((f) => f.endsWith('.css')).sort();
 
-      if (!jsFile) {
+      if (jsFiles.length === 0) {
         throw new Error('Vite build did not produce an application JS bundle for APK');
       }
 
-      const rawJs = fs.readFileSync(path.join(assetsDir, jsFile), 'utf8');
+      const rawJs = jsFiles.map((f) => fs.readFileSync(path.join(assetsDir, f), 'utf8')).join('\n');
       const iifeResult = esbuildTransformSync(rawJs, {
         format: 'iife',
         minify: true,
@@ -1746,6 +1797,8 @@ async function buildStandaloneWebBundle(): Promise<EmbeddedWebAssets> {
         indexHtml: buildApkIndexHtml(),
         appJs: Buffer.from(iifeResult.code, 'utf8'),
         appCss: Buffer.from(combinedCss, 'utf8'),
+        sourceHash: computeLiveSourceFingerprint(),
+        builtAt: new Date().toISOString(),
       };
       return cachedWebAssets;
     } finally {
@@ -1772,8 +1825,10 @@ function assembleSignedApk(webAssets: EmbeddedWebAssets, launchUrl: string, apiB
       {
         appId: 'com.hyperliquid.scarface.l1',
         appName: 'HyperLiquid Pro L1',
-        version: '2.5.0-PRO',
-        versionCode: 20500,
+        version: APK_VERSION,
+        versionCode: APK_VERSION_CODE,
+        sourceHash: webAssets.sourceHash,
+        builtAt: webAssets.builtAt,
         launchUrl,
         apiBaseUrl: (apiBaseUrl || '').replace(/\/+$/, ''),
         standaloneBundle: true,
@@ -1840,17 +1895,24 @@ function assembleSignedApk(webAssets: EmbeddedWebAssets, launchUrl: string, apiB
     signerSha256: identity.certSha256,
     sizeBytes: buffer.length,
     appUrl: launchUrl,
+    sourceHash: webAssets.sourceHash,
+    builtAt: webAssets.builtAt,
   };
 }
 
-export async function buildGenuineAndroidApkAsync(appUrl?: string): Promise<BuiltApkArtifact> {
+export async function buildGenuineAndroidApkAsync(
+  appUrl?: string,
+  forceRebuild: boolean = false
+): Promise<BuiltApkArtifact> {
   const launchUrl = APK_LOCAL_ENTRYPOINT;
   const cleanApiBase = (appUrl || '').replace(/\/+$/, '');
-  const cacheKey = `${launchUrl}|${cleanApiBase}`;
-  const cached = standaloneApkCache.get(cacheKey);
-  if (cached) return cached;
+  const webAssets = await buildStandaloneWebBundle(forceRebuild);
+  const cacheKey = `${launchUrl}|${cleanApiBase}|${webAssets.sourceHash}`;
+  if (!forceRebuild) {
+    const cached = standaloneApkCache.get(cacheKey);
+    if (cached) return cached;
+  }
 
-  const webAssets = await buildStandaloneWebBundle();
   const artifact = assembleSignedApk(webAssets, launchUrl, cleanApiBase);
   standaloneApkCache.set(cacheKey, artifact);
   return artifact;
@@ -1878,6 +1940,8 @@ export function buildGenuineAndroidApk(appUrl: string = APK_LOCAL_ENTRYPOINT): B
     indexHtml: Buffer.from('<!doctype html><html><body>Loading...</body></html>', 'utf8'),
     appJs: Buffer.from('', 'utf8'),
     appCss: Buffer.from('', 'utf8'),
+    sourceHash: computeLiveSourceFingerprint(),
+    builtAt: new Date().toISOString(),
   };
   const artifact = assembleSignedApk(
     cachedWebAssets || emptyAssets,

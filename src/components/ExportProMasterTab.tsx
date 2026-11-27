@@ -247,7 +247,7 @@ Max Drawdown Real: ${maxDrawdownPct}%
                 APLICACIÓN NATIVA ANDROID DISPONIBLE (.APK)
               </h3>
               <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                v2.5.0-PRO
+                v2.6.0-PRO
               </span>
             </div>
             <p className="text-xs text-zinc-400 font-mono">
