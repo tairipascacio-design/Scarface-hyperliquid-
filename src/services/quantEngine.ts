@@ -1,10 +1,12 @@
 import {
   BotBrainMode,
   BotExecutionMode,
+  BtcSweepReboundTrigger,
   Candle,
   ClosedTrade,
   DecisionTier,
   EnsembleDecision,
+  ExecutionPosture,
   MarketData,
   MarketRegime,
   MultiTimeframeState,
@@ -17,12 +19,16 @@ import {
   StrategyWalkForwardMetric,
   StructuredStrategySignal,
   TrendDirection,
+  VolatilitySubRegime,
   WalkForwardStats,
 } from '../types/trading';
 import {
   BE_TRIGGER_R,
   CVD_WINDOW_MAX_MS,
   CVD_WINDOW_MIN_MS,
+  DEFAULT_SIGNAL_TTL_MS,
+  HIGH_BETA_PERPS,
+  ISOLATED_SNIPER_MARGIN_DEFAULT,
   L1_ROUND_TRIP_COST_PCT,
   MAX_GLOBAL_LEVERAGE,
   MAX_SL_DISTANCE_PCT,
@@ -30,6 +36,7 @@ import {
   MIN_PRE_ORDER_RR,
   SINGLE_TP_R,
   SL_ATR_MULTIPLIER,
+  SWEEP_SIGNAL_TTL_MS,
   TRAILING_TRIGGER_R,
   UNIFIED_MIN_PILLARS,
   UNIFIED_MIN_SCORE,
@@ -215,6 +222,134 @@ function calcPearsonCorrelation(a: Candle[], b: Candle[]): number {
   return +Math.max(-1, Math.min(1, num / denom)).toFixed(2);
 }
 
+export function computeBetaVsBtc(
+  altCandles: Candle[],
+  btcCandles?: Candle[] | null,
+  altAtrPct: number = 1.6,
+  symbol: string = ''
+): number {
+  if (symbol === 'BTC-PERP') return 1.0;
+  const btcAtr = btcCandles && btcCandles.length >= 4 ? calcATRPercent(btcCandles, 14) : 1.15;
+  const atrBeta = Math.max(0.6, Math.min(2.8, altAtrPct / Math.max(0.45, btcAtr)));
+
+  if (!btcCandles || btcCandles.length < 8 || altCandles.length < 8) {
+    const baseBoost = symbol === 'ZEC-PERP' ? 1.45 : symbol === 'HYPE-PERP' ? 1.38 : symbol === 'SOL-PERP' ? 1.25 : 1.1;
+    return +Math.max(atrBeta, baseBoost).toFixed(2);
+  }
+
+  const len = Math.min(altCandles.length, btcCandles.length, 28);
+  const aSlice = altCandles.slice(-len);
+  const bSlice = btcCandles.slice(-len);
+  const retA: number[] = [];
+  const retB: number[] = [];
+  for (let i = 1; i < len; i++) {
+    retA.push(aSlice[i - 1].close > 0 ? (aSlice[i].close - aSlice[i - 1].close) / aSlice[i - 1].close : 0);
+    retB.push(bSlice[i - 1].close > 0 ? (bSlice[i].close - bSlice[i - 1].close) / bSlice[i - 1].close : 0);
+  }
+  const meanA = retA.reduce((acc, v) => acc + v, 0) / retA.length;
+  const meanB = retB.reduce((acc, v) => acc + v, 0) / retB.length;
+  let cov = 0;
+  let varB = 0;
+  for (let i = 0; i < retA.length; i++) {
+    const da = retA[i] - meanA;
+    const db = retB[i] - meanB;
+    cov += da * db;
+    varB += db * db;
+  }
+  const rawBeta = varB > 1e-10 ? cov / varB : atrBeta;
+  const blended = Math.max(0.55, Math.min(3.2, rawBeta * 0.55 + atrBeta * 0.45));
+  return +blended.toFixed(2);
+}
+
+export function classifyVolatilitySubRegime(params: {
+  atrPct: number;
+  volRatio: number;
+  curRangePct: number;
+  avgRangePct: number;
+  liveSpreadPct: number;
+  cvdMomentumPct: number;
+}): { volatilitySubRegime: VolatilitySubRegime; executionPosture: ExecutionPosture } {
+  const { atrPct, volRatio, curRangePct, avgRangePct, liveSpreadPct, cvdMomentumPct } = params;
+  if (atrPct >= 3.0 || (avgRangePct > 0 && curRangePct >= avgRangePct * 2.3) || liveSpreadPct > 0.055) {
+    return { volatilitySubRegime: 'NEWS_PANIC', executionPosture: 'WAIT_CONFIRMATION' };
+  }
+  if (atrPct < 0.85 && volRatio < 0.88 && Math.abs(cvdMomentumPct) < 14 && (avgRangePct <= 0 || curRangePct <= avgRangePct * 1.15)) {
+    return { volatilitySubRegime: 'TIGHT_RANGE', executionPosture: 'STAY_QUIET' };
+  }
+  if (volRatio >= 1.25 && Math.abs(cvdMomentumPct) >= 12 && liveSpreadPct <= 0.045) {
+    return { volatilitySubRegime: 'INSTITUTIONAL_VOLUME', executionPosture: 'SNIPER_DIRECTIONAL' };
+  }
+  return { volatilitySubRegime: 'NORMAL_FLOW', executionPosture: 'SNIPER_DIRECTIONAL' };
+}
+
+export function detectBtcLiquiditySweepRebound(
+  btcCandles?: Candle[] | null,
+  btcMarket?: MarketData | null
+): BtcSweepReboundTrigger {
+  const now = Date.now();
+  const expiresAt = now + SWEEP_SIGNAL_TTL_MS;
+
+  if (!btcCandles || btcCandles.length < 12) {
+    return {
+      sweepDetected: false,
+      reboundConfirmed: false,
+      sweptLowPrice: btcMarket?.low24h || 0,
+      reboundStrengthPct: 0,
+      absorptionWickRatio: 0,
+      detectedAt: now,
+      expiresAt,
+      summary: 'Esperando velas cortas de BTC para vigilar limpieza de liquidez.',
+    };
+  }
+
+  const priorSlice = btcCandles.slice(-22, -2);
+  const priorLow = priorSlice.length > 0 ? Math.min(...priorSlice.map((c) => c.low)) : btcCandles[0].low;
+  const avgVol =
+    priorSlice.reduce((acc, c) => acc + (c.volume || 1), 0) / Math.max(1, priorSlice.length);
+
+  const recentBars = btcCandles.slice(-3);
+  const lastBtc = btcCandles[btcCandles.length - 1];
+  const prevBtc = btcCandles[btcCandles.length - 2] || lastBtc;
+  const minRecentLow = Math.min(...recentBars.map((c) => c.low));
+
+  const intrabarFlushPct =
+    lastBtc.close > 0 ? ((Math.max(lastBtc.open, prevBtc.high) - minRecentLow) / lastBtc.close) * 100 : 0;
+  const sweptPriorLow = minRecentLow < priorLow * 0.9998 || intrabarFlushPct >= 0.45;
+
+  const barRange = Math.max(1e-8, lastBtc.high - lastBtc.low);
+  const lowerWick = Math.min(lastBtc.open, lastBtc.close) - lastBtc.low;
+  const prevRange = Math.max(1e-8, prevBtc.high - prevBtc.low);
+  const prevLowerWick = Math.min(prevBtc.open, prevBtc.close) - prevBtc.low;
+  const absorptionWickRatio = +Math.max(lowerWick / barRange, prevLowerWick / prevRange).toFixed(2);
+
+  const reclaimedLow = lastBtc.close >= priorLow * 0.9992 || lastBtc.close > prevBtc.low * 1.0018;
+  const bullTurn = lastBtc.close > lastBtc.open && reclaimedLow;
+  const reboundStrengthPct =
+    minRecentLow > 0 ? +(((lastBtc.close - minRecentLow) / minRecentLow) * 100).toFixed(2) : 0;
+  const volAbsorption = avgVol > 0 ? Math.max(lastBtc.volume || 0, prevBtc.volume || 0) >= avgVol * 1.02 : true;
+
+  const reboundConfirmed = Boolean(
+    sweptPriorLow && bullTurn && (absorptionWickRatio >= 0.3 || reboundStrengthPct >= 0.25) && volAbsorption
+  );
+
+  const summary = reboundConfirmed
+    ? `Gatillo BTC Líder CONFIRMADO: barrió $${priorLow.toFixed(0)} (mín $${minRecentLow.toFixed(0)}) y rebotó +${reboundStrengthPct}% con mecha absorción ${(absorptionWickRatio * 100).toFixed(0)}%.`
+    : sweptPriorLow
+    ? `BTC barriendo liquidez bajo $${priorLow.toFixed(0)} — esperando cierre/giro alcista de absorción antes de disparar alts.`
+    : `BTC sin barrido de mínimos reciente (soporte $${priorLow.toFixed(0)} intacto).`;
+
+  return {
+    sweepDetected: sweptPriorLow,
+    reboundConfirmed,
+    sweptLowPrice: +minRecentLow.toFixed(2),
+    reboundStrengthPct,
+    absorptionWickRatio,
+    detectedAt: now,
+    expiresAt,
+    summary,
+  };
+}
+
 function calcVolumeProfile(candles: Candle[], fallbackPx: number): { poc: number; vah: number; val: number } {
   const slice = candles.slice(-48);
   if (slice.length < 5) {
@@ -345,6 +480,7 @@ export interface EvaluateQuantEnsembleParams {
     h4?: Candle[] | null;
   };
   btcCandles?: Candle[] | null;
+  btcSweepCandles?: Candle[] | null;
   btcMarket?: MarketData | null;
   timeframe: string;
   brainMode: BotBrainMode;
@@ -368,6 +504,7 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
     candles,
     mtfCandles,
     btcCandles,
+    btcSweepCandles,
     btcMarket,
     timeframe,
     brainMode,
@@ -522,9 +659,29 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
   const avgVol = candles.slice(-20).reduce((acc, c) => acc + (c.volume || 1), 0) / Math.max(1, Math.min(20, candles.length));
   const volRatio = avgVol > 0 ? (lastBar.volume || avgVol) / avgVol : 1;
 
-  // Expiration (3x current timeframe approx, bounded 15m - 90m)
-  const expiryMinutes = timeframe === '1m' ? 8 : timeframe === '5m' ? 18 : timeframe === '15m' ? 35 : 60;
-  const expiresAt = Date.now() + expiryMinutes * 60 * 1000;
+  const recentRangeBars = candles.slice(-14, -2);
+  const avgRangePct =
+    recentRangeBars.length > 0
+      ? recentRangeBars.reduce((acc, c) => acc + (c.close > 0 ? ((c.high - c.low) / c.close) * 100 : 0), 0) / recentRangeBars.length
+      : 0.8;
+  const curRangePct = lastBar.close > 0 ? ((lastBar.high - lastBar.low) / lastBar.close) * 100 : 0;
+
+  const { volatilitySubRegime, executionPosture } = classifyVolatilitySubRegime({
+    atrPct,
+    volRatio,
+    curRangePct,
+    avgRangePct,
+    liveSpreadPct,
+    cvdMomentumPct,
+  });
+
+  const btcShortCandles = btcSweepCandles && btcSweepCandles.length >= 12 ? btcSweepCandles : btcCandles;
+  const btcSweepTrigger = detectBtcLiquiditySweepRebound(btcShortCandles, btcMarket);
+  const betaRatioVsBtc = computeBetaVsBtc(candles, btcShortCandles, atrPct, market.symbol);
+
+  // Strict 5-10s Latency TTL (7.5s for post-sweep liquidity bounces, 9s for directional snipers)
+  const signalTtlMs = btcSweepTrigger.reboundConfirmed ? SWEEP_SIGNAL_TTL_MS : DEFAULT_SIGNAL_TTL_MS;
+  const expiresAt = Date.now() + signalTtlMs;
 
   const makeSignal = (
     strategyId: StrategyId,
@@ -575,7 +732,33 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
     const strongLowerReject = lowerWick / barRange > 0.42;
     const strongUpperReject = upperWick / barRange > 0.42;
 
-    if (sweptLow && (strongLowerReject || cvdMomentumPct > 4)) {
+    const isBetaLeaderTarget =
+      market.symbol !== 'BTC-PERP' &&
+      (HIGH_BETA_PERPS as readonly string[]).includes(market.symbol) &&
+      (betaRatioVsBtc >= 1.08 || market.symbol === 'ZEC-PERP' || market.symbol === 'HYPE-PERP' || market.symbol === 'SOL-PERP');
+    const altReboundConfirm =
+      btcSweepTrigger.reboundConfirmed &&
+      isBetaLeaderTarget &&
+      liveSpreadPct <= 0.055 &&
+      rsi14 <= 68 &&
+      (lastBull || cvdMomentumPct >= 4 || orderbookRatio >= 1.12);
+
+    if (altReboundConfirm) {
+      const betaBonus = Math.min(12, Math.round((betaRatioVsBtc - 1) * 18));
+      const s = 72 + betaBonus + (strongLowerReject || sweptLow ? 8 : 0) + (cvdMomentumPct > 8 ? 6 : 0);
+      signals.push(
+        makeSignal(
+          'LIQUIDITY_SWEEP',
+          '1. Liquidity Sweep',
+          'PRIORITARIA',
+          ['RANGE_LATERAL', 'HIGH_VOLATILITY', 'BULL_TREND', 'BEAR_TREND'],
+          'LONG',
+          s,
+          1.15,
+          `[GATILLO BTC -> BETA ${betaRatioVsBtc}x] ${btcSweepTrigger.summary} Disparo LONG en ${market.symbol} (CVD ${cvdMomentumPct >= 0 ? '+' : ''}${cvdMomentumPct}%, L2 ${orderbookRatio}x).`
+        )
+      );
+    } else if (sweptLow && (strongLowerReject || cvdMomentumPct > 4)) {
       const s = 68 + (strongLowerReject ? 12 : 0) + (cvdMomentumPct > 10 ? 10 : 0) + (rsi14 < 45 ? 6 : 0);
       signals.push(
         makeSignal(
@@ -1205,23 +1388,31 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
   const conservativeWinProb = Math.min(0.65, Math.max(0.4, calibratedWrDec * 0.45 + (ensembleRawScore / 100) * 0.35));
   const netExpectedEvPct = +((conservativeWinProb * tpTargetDistancePct - (1 - conservativeWinProb) * stopDistancePct) * 100 - estimatedRoundTripCostPct).toFixed(3);
 
+  const isBtcSweepReboundShot =
+    winningSignal.strategyId === 'LIQUIDITY_SWEEP' &&
+    winningSignal.direction === 'LONG' &&
+    btcSweepTrigger.reboundConfirmed &&
+    (HIGH_BETA_PERPS as readonly string[]).includes(market.symbol);
+
   // Conteo unificado a 4 Pilares antes de firmar
   const checkDirection = winningSignal.direction;
   const pillar1Trend =
     checkDirection === 'LONG'
-      ? h4 === 'BULLISH' && (m15 === 'BULLISH' || h1 === 'BULLISH')
+      ? isBtcSweepReboundShot
+        ? m5 === 'BULLISH' || m15 === 'BULLISH' || lastBull
+        : h4 === 'BULLISH' && (m15 === 'BULLISH' || h1 === 'BULLISH')
       : checkDirection === 'SHORT'
       ? h4 === 'BEARISH' && (m15 === 'BEARISH' || h1 === 'BEARISH')
       : false;
   const pillar2Momentum =
     checkDirection === 'LONG'
-      ? rsi14 >= 42 && rsi14 <= 70 && (macdHist >= prevHist || lastBull)
+      ? rsi14 >= (isBtcSweepReboundShot ? 28 : 42) && rsi14 <= 70 && (macdHist >= prevHist || lastBull)
       : checkDirection === 'SHORT'
       ? rsi14 <= 58 && rsi14 >= 30 && (macdHist <= prevHist || !lastBull)
       : false;
   const pillar3OrderFlow =
     checkDirection === 'LONG'
-      ? cvdMomentumPct >= 8 || orderbookRatio >= 1.15
+      ? cvdMomentumPct >= (isBtcSweepReboundShot ? 4 : 8) || orderbookRatio >= 1.15
       : checkDirection === 'SHORT'
       ? cvdMomentumPct <= -8 || orderbookRatio <= 0.88
       : false;
@@ -1233,7 +1424,7 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
     winningSignal.tp3 !== winningSignal.stopLoss;
   const alignedPillarsCount = [pillar1Trend, pillar2Momentum, pillar3OrderFlow, pillar4RiskCost].filter(Boolean).length;
 
-  // Filtros estrictos de calidad de entrada, MTF 15m/1h+4h, SL 1.5x ATR <= 2.5%, 4x coste y 3/4 pilares
+  // Filtros estrictos de calidad de entrada, MTF 15m/1h+4h, régimen volatilidad, gatillo BTC líder, SL <= 2.5%
   const contradictionFilters: string[] = [];
   if (!hasFullMtf) {
     contradictionFilters.push('MTF incompleto (faltan velas reales 5m/15m/1h/4h)');
@@ -1242,6 +1433,33 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
     contradictionFilters.push(`Spread L2 amplio (${liveSpreadPct.toFixed(3)}% > 0.06%)`);
   }
   if (winningSignal.direction !== 'WAIT') {
+    if (
+      executionPosture === 'STAY_QUIET' &&
+      winningSignal.strategyId !== 'VOLATILITY_BREAKOUT' &&
+      winningSignal.strategyId !== 'LIQUIDITY_SWEEP'
+    ) {
+      contradictionFilters.push(
+        `Régimen Rango Estrecho (${volatilitySubRegime}): agente quieto para no regalar comisiones L1`
+      );
+    }
+    if (
+      executionPosture === 'WAIT_CONFIRMATION' &&
+      !(winningSignal.strategyId === 'LIQUIDITY_SWEEP' && (btcSweepTrigger.reboundConfirmed || market.symbol === 'BTC-PERP'))
+    ) {
+      contradictionFilters.push(
+        `Régimen Pánico/Noticias (${volatilitySubRegime}): esperando confirmación de barrido y absorción`
+      );
+    }
+    if (
+      market.symbol !== 'BTC-PERP' &&
+      winningSignal.direction === 'LONG' &&
+      btcSweepTrigger.sweepDetected &&
+      !btcSweepTrigger.reboundConfirmed
+    ) {
+      contradictionFilters.push(
+        'Gatillo BTC Líder en espera: BTC barrió mínimos pero falta giro alcista confirmado'
+      );
+    }
     if (stopDistancePct > MAX_SL_DISTANCE_PCT) {
       contradictionFilters.push(
         `SL 1.5x ATR (${(stopDistancePct * 100).toFixed(2)}%) supera máximo 2.5% permitido — entrada descartada`
@@ -1267,13 +1485,15 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
   }
 
   if (winningSignal.direction === 'LONG') {
-    if (h4 === 'BEARISH') {
-      contradictionFilters.push('Filtro 4h bajista bloquea LONG');
-    } else if (m15 !== 'BULLISH' && h1 !== 'BULLISH') {
-      contradictionFilters.push(`Falta confirmación 15m/1h alcista (15m ${m15}, 1h ${h1})`);
-    }
-    if (btcCorrelation >= 0.65 && btcDirection === 'BEARISH' && market.symbol !== 'BTC-PERP') {
-      contradictionFilters.push(`Correlación BTC (${btcCorrelation}) bajista bloquea LONG`);
+    if (!isBtcSweepReboundShot) {
+      if (h4 === 'BEARISH') {
+        contradictionFilters.push('Filtro 4h bajista bloquea LONG');
+      } else if (m15 !== 'BULLISH' && h1 !== 'BULLISH') {
+        contradictionFilters.push(`Falta confirmación 15m/1h alcista (15m ${m15}, 1h ${h1})`);
+      }
+      if (btcCorrelation >= 0.65 && btcDirection === 'BEARISH' && market.symbol !== 'BTC-PERP') {
+        contradictionFilters.push(`Correlación BTC (${btcCorrelation}) bajista bloquea LONG`);
+      }
     }
     if (rsi14 > 72) {
       contradictionFilters.push(`Sobrecompra FOMO RSI ${rsi14} > 72`);
@@ -1395,6 +1615,14 @@ export function evaluateQuantEnsemble(params: EvaluateQuantEnsembleParams): Ense
     skipMinNotional: sizing.skipMinNotional,
     hasFullMtf,
     quarantinedStrategies,
+    volatilitySubRegime,
+    executionPosture,
+    btcSweepTrigger,
+    betaRatioVsBtc,
+    signalTtlMs,
+    isolatedMarginRecommended:
+      ISOLATED_SNIPER_MARGIN_DEFAULT &&
+      (suggestedRiskMarginUsdc <= 25 || walletEquityUsdc < 100 || isBtcSweepReboundShot || winningSignal.strategyId === 'LIQUIDITY_SWEEP'),
     calculatedAt: Date.now(),
   };
 }

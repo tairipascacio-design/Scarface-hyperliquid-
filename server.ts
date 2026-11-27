@@ -32,11 +32,149 @@ function getGeminiClient() {
 
 function isQuotaError(err: any): boolean {
   if (!err) return false;
-  const msg = err.message || (typeof err === 'string' ? err : JSON.stringify(err));
-  return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+  const msg = String(err.message || (typeof err === 'string' ? err : JSON.stringify(err)));
+  return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.toLowerCase().includes('quota');
 }
 
-function buildFallbackGuideAnalysis(body: any) {
+function isTransientNetworkOrServerError(err: any): boolean {
+  if (!err || isQuotaError(err)) return false;
+  const msg = String(err.message || err || '');
+  return (
+    msg.includes('503') ||
+    msg.includes('502') ||
+    msg.includes('504') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('fetch failed')
+  );
+}
+
+function extractRetryAfterMs(err: any): number {
+  const raw = String(err?.message || (typeof err === 'string' ? err : JSON.stringify(err || '')) || '');
+  const retryDelayMatch = raw.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i) || raw.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  if (retryDelayMatch) {
+    const secs = Math.ceil(parseFloat(retryDelayMatch[1]));
+    return Math.max(60_000, Math.min(600_000, secs * 1000));
+  }
+  return 180_000;
+}
+
+const modelCooldownUntil: Record<string, number> = {};
+let searchGroundingCooldownUntil = 0;
+
+function getModelCooldownRemainingSec(model: string): number {
+  const until = modelCooldownUntil[model] || 0;
+  return until > Date.now() ? Math.ceil((until - Date.now()) / 1000) : 0;
+}
+
+function getAnyGeminiCooldownSec(): number {
+  const models = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+  const remaining = models.map((m) => getModelCooldownRemainingSec(m));
+  if (remaining.every((r) => r > 0)) {
+    return Math.min(...remaining);
+  }
+  return 0;
+}
+
+function markModelCooldown(model: string, err: any, routeTag: string, usedSearch: boolean = false): number {
+  const waitMs = extractRetryAfterMs(err);
+  const now = Date.now();
+  const wasAlreadyCooling = (modelCooldownUntil[model] || 0) > now;
+  modelCooldownUntil[model] = Math.max(modelCooldownUntil[model] || 0, now + waitMs);
+  if (usedSearch) {
+    searchGroundingCooldownUntil = Math.max(searchGroundingCooldownUntil, now + Math.max(waitMs, 300_000));
+  }
+  const waitSec = Math.ceil(waitMs / 1000);
+  if (!wasAlreadyCooling) {
+    console.info(
+      `[Gemini Quota] ${routeTag}: ${model} en pausa ${waitSec}s (429 RESOURCE_EXHAUSTED). Usa Settings > Secrets para clave con facturación.`
+    );
+  }
+  return waitSec;
+}
+
+function extractJsonObject<T = any>(rawText: string): T {
+  const trimmed = String(rawText || '').trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  try {
+    return JSON.parse(unfenced) as T;
+  } catch {
+    const firstBrace = unfenced.indexOf('{');
+    const lastBrace = unfenced.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(unfenced.slice(firstBrace, lastBrace + 1)) as T;
+    }
+    throw new Error('Invalid JSON in model output');
+  }
+}
+
+async function callGeminiWithResilience(params: {
+  ai: GoogleGenAI;
+  routeTag: string;
+  primaryModel: string;
+  fallbackModel?: string;
+  contents: any;
+  config?: Record<string, any>;
+  enableSearch?: boolean;
+}): Promise<{ response: any; modelUsed: string }> {
+  const { ai, routeTag, primaryModel, fallbackModel, contents, config = {}, enableSearch = false } = params;
+  const candidateModels = [primaryModel, ...(fallbackModel && fallbackModel !== primaryModel ? [fallbackModel] : [])];
+  let lastError: any = null;
+
+  for (const model of candidateModels) {
+    if (getModelCooldownRemainingSec(model) > 0) {
+      continue;
+    }
+
+    const useSearch = enableSearch && Date.now() >= searchGroundingCooldownUntil;
+    const finalConfig: Record<string, any> = { ...config };
+    if (useSearch) {
+      // Never mix responseMimeType: 'application/json' with googleSearch tool
+      delete finalConfig.responseMimeType;
+      finalConfig.tools = [{ googleSearch: {} }];
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: finalConfig,
+        });
+        return { response, modelUsed: model };
+      } catch (err: any) {
+        lastError = err;
+        if (isQuotaError(err)) {
+          markModelCooldown(model, err, routeTag, useSearch);
+          break; // Immediately stop retrying this cooling model; try fallbackModel if available
+        }
+        if (isTransientNetworkOrServerError(err) && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 600));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error('QUOTA_COOLDOWN_ACTIVE');
+}
+
+const guideAnalysisCache = new Map<string, { data: any; expiresAt: number }>();
+const guideAnalysisInFlight = new Map<string, Promise<any>>();
+const hybridValidateCache = new Map<string, { data: any; expiresAt: number }>();
+const hybridValidateInFlight = new Map<string, Promise<any>>();
+const researchCache = new Map<string, { data: any; expiresAt: number }>();
+const researchInFlight = new Map<string, Promise<any>>();
+
+function buildFallbackGuideAnalysis(
+  body: any,
+  meta?: { quotaExhausted?: boolean; retryAfterSec?: number; reason?: string }
+) {
   const { symbol = 'HYPE-PERP', currentPrice = 0, userTrades = [], botTrades = [], hasResearchReports = false } = body || {};
   const userPnl = userTrades.reduce((acc: number, t: any) => acc + (t.realizedPnl || 0), 0);
   const userWins = userTrades.filter((t: any) => (t.realizedPnl || 0) > 0).length;
@@ -45,6 +183,12 @@ function buildFallbackGuideAnalysis(body: any) {
   const botPnl = botTrades.reduce((acc: number, t: any) => acc + (t.realizedPnl || 0), 0);
   const botWins = botTrades.filter((t: any) => (t.realizedPnl || 0) > 0).length;
   const botWinRate = botTrades.length ? Math.round((botWins / botTrades.length) * 100) : 0;
+
+  const quotaExhausted = Boolean(meta?.quotaExhausted);
+  const retryAfterSec = meta?.retryAfterSec || 0;
+  const quotaNotice = quotaExhausted
+    ? `Cuota gratuita de Gemini API en pausa temporal (${retryAfterSec || 180}s). Modo Cuántico L1 activo. Agrega una clave con facturación en Settings > Secrets para análisis web ilimitado.`
+    : meta?.reason || undefined;
 
   return {
     title: `Guía Cuántica & Filtro Veto EV+: ${symbol}`,
@@ -77,7 +221,11 @@ function buildFallbackGuideAnalysis(body: any) {
     suggestedLeverage: 3,
     sources: [
       { title: 'Hyperliquid DEX Global Liquidity Radar', url: 'https://hyperliquid.xyz' }
-    ]
+    ],
+    source: quotaExhausted ? 'LOCAL_QUANT_QUOTA_COOLDOWN' : 'LOCAL_QUANT_FALLBACK',
+    quotaExhausted,
+    retryAfterSec,
+    ...(quotaNotice ? { quotaNotice } : {}),
   };
 }
 
@@ -185,14 +333,52 @@ async function startServer() {
     }
   });
 
-  // Live Hyperliquid Info Proxy (Direct from Hyperliquid L1 exchange API)
+  const fetchHyperliquidWithRetry = async (
+    url: string,
+    bodyPayload: any,
+    timeoutMs: number = 4500,
+    allowRetryOnTransient: boolean = true
+  ): Promise<Response> => {
+    const maxAttempts = allowRetryOnTransient ? 2 : 1;
+    let lastError: any = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bodyPayload),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (attempt < maxAttempts - 1 && (res.status === 429 || res.status >= 502)) {
+          await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+          continue;
+        }
+        return res;
+      } catch (err: any) {
+        clearTimeout(timer);
+        lastError = err;
+        if (attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+          continue;
+        }
+      }
+    }
+    throw lastError || new Error('Hyperliquid upstream timeout');
+  };
+
+  // Live Hyperliquid Info Proxy (Direct from Hyperliquid L1 exchange API with timeout & failover retry)
   app.post('/api/hyperliquid/info', async (req, res) => {
     try {
-      const response = await fetch('https://api.hyperliquid.xyz/info', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body || { type: 'allMids' }),
-      });
+      const response = await fetchHyperliquidWithRetry(
+        'https://api.hyperliquid.xyz/info',
+        req.body || { type: 'allMids' },
+        4500,
+        true
+      );
+      res.setHeader('X-HL-Route', 'server-proxy-l1-info');
       if (!response.ok) {
         const errText = await response.text().catch(() => '');
         return res.status(response.status).json({ error: errText || 'Hyperliquid upstream error' });
@@ -201,18 +387,20 @@ async function startServer() {
       res.json(data);
     } catch (err: any) {
       console.warn('Hyperliquid API proxy error:', err.message);
-      res.status(500).json({ error: err.message || 'Error proxying to Hyperliquid' });
+      res.status(504).json({ error: err.message || 'Error proxying to Hyperliquid' });
     }
   });
 
   // Live Hyperliquid Explorer RPC Proxy (Real txDetails / blockDetails / userDetails lookups)
   app.post('/api/hyperliquid/explorer', async (req, res) => {
     try {
-      const response = await fetch('https://rpc.hyperliquid.xyz/explorer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body || {}),
-      });
+      const response = await fetchHyperliquidWithRetry(
+        'https://rpc.hyperliquid.xyz/explorer',
+        req.body || {},
+        4500,
+        true
+      );
+      res.setHeader('X-HL-Route', 'server-proxy-l1-explorer');
       const text = await response.text();
       let parsed: any = text;
       try {
@@ -223,18 +411,21 @@ async function startServer() {
       res.status(response.status).json(parsed);
     } catch (err: any) {
       console.warn('Hyperliquid Explorer proxy error:', err.message);
-      res.status(500).json({ error: err.message || 'Error proxying to Hyperliquid explorer' });
+      res.status(504).json({ error: err.message || 'Error proxying to Hyperliquid explorer' });
     }
   });
 
   // Live Hyperliquid Exchange Gateway Proxy (Submits signed L1 actions directly to Mainnet)
   app.post('/api/hyperliquid/exchange', async (req, res) => {
     try {
-      const response = await fetch('https://api.hyperliquid.xyz/exchange', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body || {}),
-      });
+      // Only retry on transport failure/429/502+ before L1 acceptance
+      const response = await fetchHyperliquidWithRetry(
+        'https://api.hyperliquid.xyz/exchange',
+        req.body || {},
+        6000,
+        true
+      );
+      res.setHeader('X-HL-Route', 'server-proxy-l1-exchange');
       const text = await response.text();
       let parsed: any = text;
       try {
@@ -245,7 +436,7 @@ async function startServer() {
       res.status(response.status).json(parsed);
     } catch (err: any) {
       console.warn('Hyperliquid Exchange proxy error:', err.message);
-      res.status(500).json({ error: err.message || 'Error proxying to Hyperliquid exchange' });
+      res.status(504).json({ error: err.message || 'Error proxying to Hyperliquid exchange' });
     }
   });
 
@@ -536,14 +727,19 @@ async function startServer() {
 
     const probeGeminiEngine = async () => {
       const hasKey = Boolean(process.env.GEMINI_API_KEY);
+      const cooldownSec = getAnyGeminiCooldownSec();
       return {
         id: 'gemini_ai',
         name: 'Motor Gemini AI & TTS Studio',
         endpoint: '/api/ai/chat',
-        ok: hasKey,
-        httpStatus: hasKey ? 200 : 412,
+        ok: hasKey && cooldownSec === 0,
+        httpStatus: !hasKey ? 412 : cooldownSec > 0 ? 429 : 200,
         latencyMs: 1,
-        details: hasKey ? 'GEMINI_API_KEY configurada (gemini-4-hydrogen)' : 'GEMINI_API_KEY pendiente en Secrets (usando cálculo cuántico local)',
+        details: !hasKey
+          ? 'GEMINI_API_KEY pendiente en Secrets (usando cálculo cuántico local)'
+          : cooldownSec > 0
+            ? `Cuota Gemini en enfriamiento (${cooldownSec}s) — agrega clave con facturación en Settings > Secrets`
+            : 'GEMINI_API_KEY configurada (gemini-3.1-flash-lite + gemini-4-hydrogen)',
       };
     };
 
@@ -593,11 +789,6 @@ Personalidad y estilo:
 Contexto actual de la plataforma (Mercado en vivo, Trades del Usuario, Trades del Bot y Bóveda):
 ${JSON.stringify(marketContext || {}, null, 2)}`;
 
-      const tools: any[] = [];
-      if (enableSearch) {
-        tools.push({ googleSearch: {} });
-      }
-
       const formattedContents = (messages || []).map((m: any) => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: m.content }],
@@ -610,13 +801,17 @@ ${JSON.stringify(marketContext || {}, null, 2)}`;
         });
       }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const { response } = await callGeminiWithResilience({
+        ai,
+        routeTag: '/api/ai/chat',
+        primaryModel: 'gemini-4-hydrogen',
+        fallbackModel: 'gemini-3.1-flash-lite',
         contents: formattedContents,
         config: {
           systemInstruction,
-          ...(tools.length > 0 ? { tools } : {}),
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
+        enableSearch: Boolean(enableSearch),
       });
 
       const text = response.text || 'Sin respuesta del modelo.';
@@ -636,46 +831,54 @@ ${JSON.stringify(marketContext || {}, null, 2)}`;
 
       res.json({ text, groundingUrls });
     } catch (error: any) {
-      console.warn('Fallback in /api/ai/chat due to Gemini API response (e.g. 429 quota):', error.message);
-      // Return high-value in-character fallback response instead of breaking
+      const quotaHit = isQuotaError(error) || String(error?.message || '').includes('QUOTA_COOLDOWN_ACTIVE');
+      const cooldownSec = getAnyGeminiCooldownSec();
+      if (!quotaHit) {
+        console.info('[Gemini Chat] Fallback local:', error?.message || 'Error temporal');
+      }
       res.json({
         text: `¡Dímelo socio! Estoy monitoreando el mercado en vivo de Hyperliquid para ${req.body?.marketContext?.activeSymbol || 'HYPE-PERP'} en $${req.body?.marketContext?.price ?? '0'} con funding en ${((req.body?.marketContext?.fundingRate || 0) * 100).toFixed(4)}%.
         
-${isQuotaError(error) ? '(⚡ Aviso del Cartel: Tu cuota gratuita de Gemini API está en 429. Puedes habilitar una billing API key en Settings > Secrets para cuota ilimitada sin pausas).' : ''}
+${quotaHit ? `(⚡ Aviso del Cartel: Cuota gratuita de Gemini API en pausa temporal${cooldownSec ? ` (${cooldownSec}s)` : ''}. Selecciona una billing API key en Settings > Secrets para cuota ilimitada).` : ''}
 
 El plan de acción no cambia: Mantén la disciplina con los stops técnicos y ratios R:R de 2.5:1. "THE WORLD IS YOURS." ¿Quieres que preparemos la siguiente orden?`,
         groundingUrls: [
           { title: 'Hyperliquid DEX Stats & Info', url: 'https://hyperliquid.xyz' },
           { title: 'TradingView Crypto Community Ideas', url: 'https://tradingview.com' },
         ],
+        quotaExhausted: quotaHit,
+        retryAfterSec: cooldownSec,
       });
     }
   });
 
-  // Deep Market & Ecosystem Research with Google Search Grounding (Fail-safe)
+  // Deep Market & Ecosystem Research with Google Search Grounding (Fail-safe + Cached)
   app.post('/api/ai/research', async (req, res) => {
     try {
       const { query, topic = 'Hyperliquid Perpetual Futures & Market Regime' } = req.body;
-      const ai = getGeminiClient();
+      const cacheKey = `${String(query || '').trim().toLowerCase()}|${String(topic || '').trim().toLowerCase()}`;
+      const cached = researchCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json(cached.data);
+      }
 
+      const ai = getGeminiClient();
       if (!ai) {
         return res.json({
           title: `Dossier de Inteligencia Bélica: ${topic}`,
-          summary: 'Informe confidencial del cartel de Hyperliquid: Las calles de los perps están calientes y el dinero fluye.',
-          findings: [
-            '"El mundo es tuyo si sabes apretar el gatillo": Tasas de funding neutrales (+0.012%), los sapos que sobre-apalancan están a punto de ser liquidados en cascada.',
-            'Volumen masivo detectado en HYPE-PERP y BTC-PERP: Los peces gordos están acumulando silenciosamente en el soporte.',
-            'Plan del Patrón: Mantener el bot en modo ofensivo, cazando rebotes en los pools de liquidez y cobrando el financiamiento cada 8 horas.',
-          ],
-          marketRegime: 'Imperio Alcista con Compresión de Volatilidad Bélica',
-          sentimentScore: 88,
-          citations: [
-            { title: 'Hyperliquid Vault & Liquidity Command', url: 'https://hyperliquid.xyz' },
-          ],
+          content: 'GEMINI_API_KEY pendiente en Secrets. Radar L1 operando en modo cuantitativo local sobre liquidez de Hyperliquid.',
+          citations: [{ title: 'Hyperliquid Vault & Liquidity Command', url: 'https://hyperliquid.xyz' }],
+          timestamp: new Date().toISOString(),
         });
       }
 
-      const prompt = `Realiza una investigación profunda y de inteligencia militar/financiera usando Google Search sobre:
+      const existing = researchInFlight.get(cacheKey);
+      if (existing) {
+        return res.json(await existing);
+      }
+
+      const task = (async () => {
+        const prompt = `Realiza una investigación profunda y de inteligencia financiera sobre:
 "${query || 'Hyperliquid DEX crypto funding rates perpetuals market sentiment bitcoin ethereum hype token'}".
 
 Devuelve tu reporte con el carácter y la contundencia de Tony Montana (Scarface) analizando el terreno de batalla de los mercados financieros:
@@ -684,50 +887,69 @@ Devuelve tu reporte con el carácter y la contundencia de Tony Montana (Scarface
 3. Oportunidades del Cartel para el Bot Autónomo ("Say Hello to My Little Friend")
 4. Zonas de Emboscada y Trampas de Liquidación que debemos evitar`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
+        const { response } = await callGeminiWithResilience({
+          ai,
+          routeTag: '/api/ai/research',
+          primaryModel: 'gemini-4-hydrogen',
+          fallbackModel: 'gemini-3.1-flash-lite',
+          contents: prompt,
+          config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+          enableSearch: true,
+        });
 
-      const text = response.text || '';
-      const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      const citations: { title: string; url: string }[] = [];
+        const text = response.text || '';
+        const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        const citations: { title: string; url: string }[] = [];
 
-      if (groundingChunks && Array.isArray(groundingChunks)) {
-        for (const chunk of groundingChunks) {
-          if (chunk.web?.uri) {
-            citations.push({
-              title: chunk.web.title || chunk.web.uri,
-              url: chunk.web.uri,
-            });
+        if (groundingChunks && Array.isArray(groundingChunks)) {
+          for (const chunk of groundingChunks) {
+            if (chunk.web?.uri) {
+              citations.push({
+                title: chunk.web.title || chunk.web.uri,
+                url: chunk.web.uri,
+              });
+            }
           }
         }
-      }
 
-      res.json({
-        title: `Investigación en Vivo: ${topic}`,
-        content: text,
-        citations,
-        timestamp: new Date().toISOString(),
-      });
+        const result = {
+          title: `Investigación en Vivo: ${topic}`,
+          content: text,
+          citations,
+          timestamp: new Date().toISOString(),
+        };
+        researchCache.set(cacheKey, { data: result, expiresAt: Date.now() + 10 * 60_000 });
+        return result;
+      })();
+
+      researchInFlight.set(cacheKey, task);
+      try {
+        const result = await task;
+        return res.json(result);
+      } finally {
+        researchInFlight.delete(cacheKey);
+      }
     } catch (error: any) {
-      console.warn('Fallback in /api/ai/research due to Gemini API response (e.g. 429 quota):', error.message);
+      const quotaHit = isQuotaError(error) || String(error?.message || '').includes('QUOTA_COOLDOWN_ACTIVE');
+      const cooldownSec = getAnyGeminiCooldownSec();
+      if (!quotaHit) {
+        console.info('[Gemini Research] Fallback local:', error?.message || 'Error temporal');
+      }
       res.json({
         title: `Dossier de Inteligencia Bélica: ${req.body?.topic || 'Hyperliquid L1 Perps'}`,
-        content: `### Resumen de Mercado del Cartel (Modo Resiliente)
+        content: `### Resumen de Mercado del Cartel (Modo Cuántico Local)
 - **Consenso de la Comunidad:** Las tasas de financiamiento anualizadas se mantienen neutrales (+0.012%), lo que indica bajo riesgo de liquidaciones en cascada inmediatas.
 - **Flujo Institucional:** El volumen institucional en HYPE-PERP y BTC-PERP se concentra en niveles clave de soporte de VWAP diario.
 - **Recomendación Algorítmica:** Favorecer compras en pullbacks hacia pools de liquidez y scalping de desequilibrios en el libro de órdenes L2.
 
-*(Nota: Motor de investigación en modo de contingencia por límite 429 de cuota gratuita. Agrega tu billing key en Settings > Secrets para consultas en vivo ilimitadas)*`,
+*(Nota: Cuota gratuita de Gemini en enfriamiento${cooldownSec ? ` (${cooldownSec}s)` : ''}. Agrega una API key con facturación en Settings > Secrets para consultas web en vivo ilimitadas.)*`,
         citations: [
           { title: 'Hyperliquid DEX Global Liquidity Radar', url: 'https://hyperliquid.xyz' },
           { title: 'TradingView Community Indicators', url: 'https://tradingview.com' }
         ],
         timestamp: new Date().toISOString(),
+        quotaExhausted: quotaHit,
+        retryAfterSec: cooldownSec,
       });
     }
   });
@@ -777,8 +999,11 @@ Responde ÚNICAMENTE con JSON válido:
   "patternIdentified": string
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const { response } = await callGeminiWithResilience({
+        ai,
+        routeTag: '/api/ai/signal',
+        primaryModel: 'gemini-3.1-flash-lite',
+        fallbackModel: 'gemini-4-hydrogen',
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -788,9 +1013,9 @@ Responde ÚNICAMENTE con JSON válido:
 
       let parsed;
       try {
-        parsed = JSON.parse(response.text || '{}');
+        parsed = extractJsonObject(response.text || '{}');
         parsed.suggestedLeverage = Math.max(1, Math.min(3, Number(parsed.suggestedLeverage || 3)));
-      } catch (e) {
+      } catch {
         parsed = {
           action: 'HOLD',
           confidence: 70,
@@ -805,7 +1030,10 @@ Responde ÚNICAMENTE con JSON válido:
 
       res.json(parsed);
     } catch (error: any) {
-      console.warn('Fallback in /api/ai/signal due to Gemini API response (e.g. 429 quota):', error.message);
+      const quotaHit = isQuotaError(error) || String(error?.message || '').includes('QUOTA_COOLDOWN_ACTIVE');
+      if (!quotaHit) {
+        console.info('[Gemini Signal] Fallback local:', error?.message || 'Error temporal');
+      }
       const isBullish = fundingRate >= 0;
       const action = isBullish ? 'LONG' : 'SHORT';
       const slDistance = currentPrice * 0.015;
@@ -821,6 +1049,7 @@ Responde ÚNICAMENTE con JSON válido:
         suggestedLeverage: 3,
         rationale: `Señal algorítmica de reserva en ${symbol} a 3x máximo.`,
         patternIdentified: 'Orderbook Wall Absorption Scalp',
+        quotaExhausted: quotaHit,
       });
     }
   });
@@ -852,8 +1081,11 @@ Responde ÚNICAMENTE en JSON con:
   "confidenceMultiplier": number (factor numérico, ej: 1.05 o 0.92)
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const { response } = await callGeminiWithResilience({
+        ai,
+        routeTag: '/api/ai/learn',
+        primaryModel: 'gemini-3.1-flash-lite',
+        fallbackModel: 'gemini-4-hydrogen',
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -863,7 +1095,7 @@ Responde ÚNICAMENTE en JSON con:
 
       let result;
       try {
-        result = JSON.parse(response.text || '{}');
+        result = extractJsonObject(response.text || '{}');
       } catch {
         result = {
           lesson: `Análisis registrado para ${trade?.symbol}. Patrón optimizado para ejecución futura.`,
@@ -874,7 +1106,10 @@ Responde ÚNICAMENTE en JSON con:
 
       res.json(result);
     } catch (error: any) {
-      console.warn('Fallback in /api/ai/learn due to Gemini API response:', error.message);
+      const quotaHit = isQuotaError(error) || String(error?.message || '').includes('QUOTA_COOLDOWN_ACTIVE');
+      if (!quotaHit) {
+        console.info('[Gemini Learn] Fallback local:', error?.message || 'Error temporal');
+      }
       const isWin = (trade?.realizedPnl || 0) >= 0;
       res.json({
         lesson: isWin
@@ -886,26 +1121,38 @@ Responde ÚNICAMENTE en JSON con:
     }
   });
 
-  // Comprehensive Global Internet Community Knowledge & Dual-Trades Analysis Guide (Fail-safe against 429)
+  // Comprehensive Global Internet Community Knowledge & Dual-Trades Analysis Guide (Cached + Cooldown + Fail-safe)
   app.post('/api/ai/guide-analysis', async (req, res) => {
     try {
-      const { symbol, currentPrice, fundingRate, orderbook, userTrades = [], botTrades = [], customTopic, hasResearchReports = false } = req.body;
-      const ai = getGeminiClient();
-
-      if (!ai) {
-        return res.json(buildFallbackGuideAnalysis(req.body));
+      const { symbol = 'HYPE-PERP', currentPrice = 0, fundingRate = 0, orderbook, userTrades = [], botTrades = [], customTopic = '', hasResearchReports = false } = req.body || {};
+      const topicNorm = String(customTopic || '').trim().toLowerCase();
+      const cacheKey = `${symbol}|${topicNorm}|${Boolean(hasResearchReports)}|${userTrades.length}|${botTrades.length}`;
+      const cached = guideAnalysisCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json(cached.data);
       }
 
-      const prompt = `Actúa como Tony Montana, el auditor de riesgo cuantitativo de SCARFACE L1 en Hyperliquid Perps.
+      const ai = getGeminiClient();
+      if (!ai) {
+        return res.json(buildFallbackGuideAnalysis(req.body, { reason: 'GEMINI_API_KEY no configurada en Secrets.' }));
+      }
+
+      const existing = guideAnalysisInFlight.get(cacheKey);
+      if (existing) {
+        return res.json(await existing);
+      }
+
+      const task = (async () => {
+        const prompt = `Actúa como Tony Montana, el auditor de riesgo cuantitativo de SCARFACE L1 en Hyperliquid Perps.
 REGLA CRÍTICA: La IA solo actúa como filtro de veto / análisis sin modificar tamaño, SL (1.5x ATR máx 2.5%), TP (+2.5R) ni apalancamiento (tope global 3x máximo).
 Si hasResearchReports=${Boolean(hasResearchReports)} es false, el peso de sabiduría internet es 0%.
 Datos actuales:
-Par: ${symbol}, Precio: $${currentPrice}, Funding 8h: ${(fundingRate * 100).toFixed(4)}%, Spread: ${(orderbook?.spread || 0.01)}%.
-Trades manuales recientes: ${JSON.stringify(userTrades.slice(0, 8))}
-Trades del bot recientes: ${JSON.stringify(botTrades.slice(0, 8))}
+Par: ${symbol}, Precio: $${currentPrice}, Funding 8h: ${(Number(fundingRate || 0) * 100).toFixed(4)}%, Spread: ${(orderbook?.spread || 0.01)}%.
+Trades manuales recientes: ${JSON.stringify((userTrades || []).slice(0, 6))}
+Trades del bot recientes: ${JSON.stringify((botTrades || []).slice(0, 6))}
 Enfoque: ${customTopic || 'Auditoría táctica y detección de trampas estructurales'}
 
-Responde ÚNICAMENTE JSON válido:
+Responde ÚNICAMENTE con un objeto JSON válido (sin markdown ni texto extra):
 {
   "title": string,
   "internetWisdom": {
@@ -920,41 +1167,69 @@ Responde ÚNICAMENTE JSON válido:
   "suggestedLeverage": number (entre 1 y 3)
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          tools: [{ googleSearch: {} }],
-        },
-      });
+        const useWebSearch = Boolean(topicNorm);
+        const { response, modelUsed } = await callGeminiWithResilience({
+          ai,
+          routeTag: '/api/ai/guide-analysis',
+          primaryModel: useWebSearch ? 'gemini-4-hydrogen' : 'gemini-3.1-flash-lite',
+          fallbackModel: useWebSearch ? 'gemini-3.1-flash-lite' : 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+          enableSearch: useWebSearch,
+        });
 
-      const result = JSON.parse(response.text || '{}');
-      result.suggestedLeverage = Math.max(1, Math.min(3, Number(result.suggestedLeverage || 3)));
-      if (result.internetWisdom) {
-        result.internetWisdom.weightPct = hasResearchReports ? 25 : 0;
-      }
-      const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      const sources: { title: string; url: string }[] = [];
-      if (groundingChunks && Array.isArray(groundingChunks)) {
-        for (const chunk of groundingChunks) {
-          if (chunk.web?.uri) {
-            sources.push({
-              title: chunk.web.title || chunk.web.uri,
-              url: chunk.web.uri,
-            });
+        const result = extractJsonObject(response.text || '{}');
+        result.suggestedLeverage = Math.max(1, Math.min(3, Number(result.suggestedLeverage || 3)));
+        if (result.internetWisdom) {
+          result.internetWisdom.weightPct = hasResearchReports ? 25 : 0;
+        }
+        const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        const sources: { title: string; url: string }[] = [];
+        if (groundingChunks && Array.isArray(groundingChunks)) {
+          for (const chunk of groundingChunks) {
+            if (chunk.web?.uri) {
+              sources.push({
+                title: chunk.web.title || chunk.web.uri,
+                url: chunk.web.uri,
+              });
+            }
           }
         }
+        result.sources = sources.length > 0 ? sources : [{ title: 'Hyperliquid DEX Global Liquidity Radar', url: 'https://hyperliquid.xyz' }];
+        result.source = `GEMINI_${modelUsed.toUpperCase()}`;
+        result.quotaExhausted = false;
+
+        guideAnalysisCache.set(cacheKey, { data: result, expiresAt: Date.now() + 10 * 60_000 });
+        return result;
+      })();
+
+      guideAnalysisInFlight.set(cacheKey, task);
+      try {
+        const result = await task;
+        return res.json(result);
+      } finally {
+        guideAnalysisInFlight.delete(cacheKey);
       }
-      result.sources = sources;
-      res.json(result);
     } catch (err: any) {
-      console.warn('Fallback in /api/ai/guide-analysis due to Gemini API response (e.g. 429 quota):', err.message);
-      res.json(buildFallbackGuideAnalysis(req.body));
+      const quotaHit = isQuotaError(err) || String(err?.message || '').includes('QUOTA_COOLDOWN_ACTIVE');
+      const retryAfterSec = getAnyGeminiCooldownSec() || 180;
+      if (!quotaHit) {
+        console.info('[Gemini Guide] Fallback cuantitativo local:', err?.message || 'Error temporal');
+      }
+      res.json(
+        buildFallbackGuideAnalysis(req.body, {
+          quotaExhausted: quotaHit,
+          retryAfterSec,
+          reason: quotaHit ? undefined : err?.message,
+        })
+      );
     }
   });
 
-  // Strict AI Veto & Bull Trap / Structural Invalidation Filter (NEVER boosts score or alters sizing/SL/TP/leverage)
+  // Strict AI Veto & Bull Trap / Structural Invalidation Filter (Cached + Cooldown + NEVER alters sizing/SL/TP/leverage)
   app.post('/api/ai/hybrid-validate', async (req, res) => {
     const {
       symbol = 'BTC-PERP',
@@ -991,7 +1266,19 @@ Responde ÚNICAMENTE JSON válido:
         return res.json(fallbackResponse);
       }
 
-      const prompt = `Eres un auditor de veto cuantitativo en Hyperliquid L1 (estilo directo Tony Montana).
+      const cacheKey = `${symbol}|${direction}|${regime}|${Math.floor(score / 5)}|${pillarsCount}|${Boolean(isPositionExitCheck)}`;
+      const cached = hybridValidateCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json(cached.data);
+      }
+
+      const existing = hybridValidateInFlight.get(cacheKey);
+      if (existing) {
+        return res.json(await existing);
+      }
+
+      const task = (async () => {
+        const prompt = `Eres un auditor de veto cuantitativo en Hyperliquid L1 (estilo directo Tony Montana).
 TU ÚNICO ROL ES VETAR O APROBAR (SIN sumar puntos al score ni modificar tamaño, SL, TP o apalancamiento 3x):
 - ${isPositionExitCheck ? 'Evalúa si una posición abierta debe CERRARSE por Bull Trap o invalidación estructural.' : 'Evalúa si esta entrada LIVE debe ser VETADA por Bull Trap, Bear Trap o invalidación estructural.'}
 Par: ${symbol} | Dirección: ${direction} | Estrategia: ${strategyName} | Régimen: ${regime}
@@ -1000,33 +1287,47 @@ Score Cuantitativo: ${score}/100 | Pilares: ${pillarsCount}/4 | RSI14: ${rsi14} 
 Responde ÚNICAMENTE JSON válido:
 { "approved": boolean, "bullTrapDetected": boolean, "structuralInvalidation": boolean, "summary": string (máx 180 chars en español) }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      });
-      const parsed = JSON.parse(response.text || '{}');
-      const bullTrap = Boolean(parsed.bullTrapDetected);
-      const invalidation = Boolean(parsed.structuralInvalidation);
-      const approved = typeof parsed.approved === 'boolean' ? parsed.approved && !bullTrap && !invalidation : mathApproved;
-      return res.json({
-        approved,
-        bullTrapDetected: bullTrap,
-        structuralInvalidation: invalidation,
-        confidenceAdjustment: 0, // NUNCA suma puntos al score
-        summary: parsed.summary || fallbackResponse.summary,
-        source: 'GEMINI_VETO_FILTER',
-      });
+        const { response } = await callGeminiWithResilience({
+          ai,
+          routeTag: '/api/ai/hybrid-validate',
+          primaryModel: 'gemini-3.1-flash-lite',
+          fallbackModel: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        });
+        const parsed = extractJsonObject(response.text || '{}');
+        const bullTrap = Boolean(parsed.bullTrapDetected);
+        const invalidation = Boolean(parsed.structuralInvalidation);
+        const approved = typeof parsed.approved === 'boolean' ? parsed.approved && !bullTrap && !invalidation : mathApproved;
+        const result = {
+          approved,
+          bullTrapDetected: bullTrap,
+          structuralInvalidation: invalidation,
+          confidenceAdjustment: 0, // NUNCA suma puntos al score
+          summary: parsed.summary || fallbackResponse.summary,
+          source: 'GEMINI_VETO_FILTER',
+        };
+        hybridValidateCache.set(cacheKey, { data: result, expiresAt: Date.now() + 90_000 });
+        return result;
+      })();
+
+      hybridValidateInFlight.set(cacheKey, task);
+      try {
+        return res.json(await task);
+      } finally {
+        hybridValidateInFlight.delete(cacheKey);
+      }
     } catch {
       return res.json(fallbackResponse);
     }
   });
 
-  // Text-To-Speech (TTS) Voice Synthesis (Fail-safe)
+  // Text-To-Speech (TTS) Voice Synthesis (Cooldown-aware + Fail-safe)
   app.post('/api/ai/tts', async (req, res) => {
+    const ttsModel = 'gemini-3.8-flash-lite-tts';
     try {
       const { text, voice = 'Kore' } = req.body;
       const ai = getGeminiClient();
@@ -1037,13 +1338,21 @@ Responde ÚNICAMENTE JSON válido:
         });
       }
 
+      const cooldownSec = getModelCooldownRemainingSec(ttsModel);
+      if (cooldownSec > 0) {
+        return res.status(429).json({
+          error: `Cuota de audio en pausa temporal (${cooldownSec}s). Usando voz nativa del dispositivo.`,
+          retryAfterSec: cooldownSec,
+        });
+      }
+
       const promptText = String(text || '').trim().substring(0, 1800);
       if (!promptText) {
         return res.status(400).json({ error: 'Texto vacío para síntesis de voz.' });
       }
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
+        model: ttsModel,
         contents: [
           {
             role: 'user',
@@ -1077,8 +1386,15 @@ Responde ÚNICAMENTE JSON válido:
         mimeType: 'audio/wav',
       });
     } catch (error: any) {
-      console.warn('TTS error (e.g. 429 quota):', error.message);
-      res.status(429).json({ error: 'Cuota de audio agotada temporalmente. Por favor intente en unos minutos.' });
+      const isQuota = isQuotaError(error);
+      const retryAfterSec = isQuota ? markModelCooldown(ttsModel, error, '/api/ai/tts', false) : 60;
+      if (!isQuota) {
+        console.info('[Gemini TTS] Fallback a voz nativa:', error?.message || 'Error temporal');
+      }
+      res.status(429).json({
+        error: 'Cuota de audio agotada temporalmente. Usando voz nativa del sistema.',
+        retryAfterSec,
+      });
     }
   });
 

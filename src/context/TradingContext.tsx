@@ -55,15 +55,24 @@ import { evaluateQuantEnsemble, runWalkForwardValidation } from '../services/qua
 import {
   WHITELIST_PERPS,
   WHITELIST_TIMEFRAMES,
+  HIGH_BETA_PERPS,
   MAX_GLOBAL_LEVERAGE,
   MIN_VIABLE_NOTIONAL_USDC,
   MAX_SL_DISTANCE_PCT,
   BE_TRIGGER_R,
   BE_PRICE_BUFFER_PCT,
+  BE_FEE_SPREAD_COVER_MULT,
+  BE_MIN_ADVANCE_PCT,
+  L1_ROUND_TRIP_COST_PCT,
   PARTIAL_TP_MIN_NOTIONAL_USDC,
   SINGLE_TP_R,
   TRAILING_TRIGGER_R,
   TRAILING_GIVEBACK_R,
+  TRAILING_WHIPLASH_GIVEBACK_R,
+  TRAILING_RUNNER_MAX_R,
+  DEFAULT_SIGNAL_TTL_MS,
+  MAX_SIGNAL_PRICE_DRIFT_RATIO,
+  ISOLATED_SNIPER_MARGIN_DEFAULT,
   MAX_TRADES_PER_DAY,
   SL_COOLDOWN_CANDLES,
   CONSECUTIVE_SL_PAUSE_COUNT,
@@ -242,6 +251,20 @@ const EMPTY_MARKETS: Record<MarketSymbol, MarketData> = {
     tickSize: 0.001,
     stepSize: 0.5,
   },
+  'ZEC-PERP': {
+    symbol: 'ZEC-PERP',
+    name: 'Zcash Perpetual',
+    price: 0,
+    change24h: 0,
+    high24h: 0,
+    low24h: 0,
+    volume24h: 0,
+    fundingRate: 0,
+    openInterest: 0,
+    maxLeverage: 10,
+    tickSize: 0.01,
+    stepSize: 0.01,
+  },
 };
 
 const CORE_STRATEGIES: LearnedPattern[] = [
@@ -338,6 +361,7 @@ interface TradingContextType {
     leverage: number;
     takeProfit?: number;
     stopLoss?: number;
+    isCross?: boolean;
   }) => Promise<boolean>;
   closePosition: (id: string, reason?: ClosedTrade['closedReason']) => void;
   closeAllPositions: () => void;
@@ -672,6 +696,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
     h1?: Candle[] | null;
     h4?: Candle[] | null;
     btcCandles?: Candle[] | null;
+    btc5mCandles?: Candle[] | null;
     fetchedAt: number;
   }>({ symbol: '', fetchedAt: 0 });
   const positionPlanRef = useRef<
@@ -695,6 +720,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         score?: number;
         expectedEvPct?: number;
         spreadAtEntryPct?: number;
+        isIsolated?: boolean;
       }
     >
   >(
@@ -733,6 +759,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         score?: number;
         expectedEvPct?: number;
         spreadAtEntryPct?: number;
+        isIsolated?: boolean;
       }
     >
   >(
@@ -1673,6 +1700,12 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
               singleTpMode: savedPlan?.singleTpMode ?? notionalAtEntry < PARTIAL_TP_MIN_NOTIONAL_USDC,
               trailingActive: Boolean(savedPlan?.trailingActive),
               peakR: savedPlan?.peakR || 0,
+              isIsolated:
+                p.leverage?.type === 'isolated'
+                  ? true
+                  : p.leverage?.type === 'cross'
+                  ? false
+                  : savedPlan?.isIsolated ?? aiMatch?.isIsolated,
             };
           });
 
@@ -2065,6 +2098,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       leverage: number;
       takeProfit?: number;
       stopLoss?: number;
+      isCross?: boolean;
     }): Promise<boolean> => {
       const availableMargin = Math.max(wallet.hyperliquidAccountValue || 0, wallet.balances.USDC || 0);
       if (availableMargin < params.margin || availableMargin <= 0) {
@@ -2102,6 +2136,8 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const size = +(notional / curPrice).toFixed(szDecimals);
       const signingKey = wallet.apiWalletKey || wallet.privateKey;
       const baseCoin = params.symbol.replace('-PERP', '');
+      const useIsolatedManual =
+        params.isCross !== undefined ? !params.isCross : ISOLATED_SNIPER_MARGIN_DEFAULT && params.margin <= 25;
 
       try {
         const l1Result = await submitHyperliquidL1Order({
@@ -2111,6 +2147,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           price: curPrice,
           size,
           leverage: safeLeverage,
+          isCross: !useIsolatedManual,
           tif: 'Alo',
         });
 
@@ -2440,9 +2477,17 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
       try {
         const pxDec = pos.entryPrice < 0.01 ? 6 : pos.entryPrice < 1 ? 4 : pos.entryPrice < 10 ? 3 : 2;
-        // Buffer neto positivo (+0.15%) cubre el coste ida y vuelta en Hyperliquid L1 (0.12%)
+        const liveSpreadPct =
+          pos.symbol === activeSymbol && orderBook.bids[0]?.price && orderBook.asks[0]?.price
+            ? ((orderBook.asks[0].price - orderBook.bids[0].price) / orderBook.bids[0].price) * 100
+            : positionPlanRef.current[beKey]?.spreadAtEntryPct ?? 0.03;
+        // Cubrir exactamente spread en vivo + comisión ida/vuelta L1 (0.12%)
+        const effectiveBeBufferPct = Math.max(
+          BE_PRICE_BUFFER_PCT,
+          (liveSpreadPct + L1_ROUND_TRIP_COST_PCT) / 100
+        );
         const bePx = +(
-          pos.side === 'LONG' ? pos.entryPrice * (1 + BE_PRICE_BUFFER_PCT) : pos.entryPrice * (1 - BE_PRICE_BUFFER_PCT)
+          pos.side === 'LONG' ? pos.entryPrice * (1 + effectiveBeBufferPct) : pos.entryPrice * (1 - effectiveBeBufferPct)
         ).toFixed(pxDec);
         const baseCoin = pos.symbol.replace('-PERP', '');
         const signingKey = wallet.apiWalletKey || wallet.privateKey;
@@ -2481,6 +2526,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           )
         );
 
+        const bufferDisplayPct = (effectiveBeBufferPct * 100).toFixed(2);
         setAiLogs((prev) => [
           {
             id: `${Date.now()}-be-arm`,
@@ -2488,7 +2534,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
             type: 'RISK_CHECK',
             symbol: pos.symbol,
             message: trigRes.ok
-              ? `[SEGURO BREAK-EVEN L1 NETO+] Trigger SL armado en Mainnet @ $${bePx} (+0.15% buffer fees L1, OID ${trigRes.oid || 'L1'}) para ${pos.symbol} ${pos.side}.`
+              ? `[SEGURO BREAK-EVEN L1 NETO+] Trigger SL armado en Mainnet @ $${bePx} (+${bufferDisplayPct}% cubre spread+fees L1, OID ${trigRes.oid || 'L1'}) para ${pos.symbol} ${pos.side}.`
               : `[SEGURO BREAK-EVEN ACTIVO] Guardia neta positiva fijada @ $${bePx} para ${pos.symbol} ${pos.side}.`,
           },
           ...prev.slice(0, 49),
@@ -2498,14 +2544,14 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           type: 'success',
           title: `Seguro Break-Even Armado: ${pos.symbol}`,
           message: trigRes.ok
-            ? `Orden Stop L1 colocada en $${bePx} (+0.15% tras fees, OID ${trigRes.oid || 'OK'}).`
+            ? `Orden Stop L1 colocada en $${bePx} (+${bufferDisplayPct}% tras spread+fees, OID ${trigRes.oid || 'OK'}).`
             : `Guardia Break-Even en vivo activada en $${bePx}.`,
         });
       } finally {
         breakEvenInFlightRef.current[beKey] = false;
       }
     },
-    [wallet.apiWalletKey, wallet.privateKey, addToast]
+    [activeSymbol, orderBook.bids, orderBook.asks, wallet.apiWalletKey, wallet.privateKey, addToast]
   );
 
   const togglePositionBreakEven = useCallback(
@@ -2514,11 +2560,11 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (!pos) return;
 
       if (forceArmNow) {
-        if ((pos.unrealizedPnlPercent || 0) < 0.8) {
+        if ((pos.unrealizedPnlPercent || 0) < 0.35) {
           addToast({
             type: 'warning',
-            title: 'Break-Even neto requiere ganancia mínima (+0.8% ROE)',
-            message: `${pos.symbol} está en ${pos.unrealizedPnlPercent.toFixed(2)}% ROE. Al superar +${BE_TRIGGER_R}R fija Break-Even (+0.15%) automáticamente.`,
+            title: 'Break-Even neto requiere ganancia mínima (+0.35% ROE)',
+            message: `${pos.symbol} está en ${pos.unrealizedPnlPercent.toFixed(2)}% ROE. Al cubrir spread+comisión L1 se arma automáticamente.`,
           });
           return;
         }
@@ -2572,13 +2618,22 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const riskDist = pos.stopLoss && pos.stopLoss > 0 ? Math.abs(pos.entryPrice - pos.stopLoss) : pos.entryPrice * 0.015;
       const favorableMove =
         pos.side === 'LONG' ? pos.currentPrice - pos.entryPrice : pos.entryPrice - pos.currentPrice;
+      const favorableMovePct = pos.entryPrice > 0 ? favorableMove / pos.entryPrice : 0;
       const rMultiple = riskDist > 0 ? favorableMove / riskDist : 0;
+      const spreadEstPct =
+        pos.symbol === activeSymbol && orderBook.bids[0]?.price && orderBook.asks[0]?.price
+          ? ((orderBook.asks[0].price - orderBook.bids[0].price) / orderBook.bids[0].price) * 100
+          : positionPlanRef.current[`${pos.symbol}-${pos.side}`]?.spreadAtEntryPct ?? 0.03;
+      const minBeCoverPct = Math.max(
+        BE_MIN_ADVANCE_PCT,
+        ((spreadEstPct + L1_ROUND_TRIP_COST_PCT) * BE_FEE_SPREAD_COVER_MULT) / 100
+      );
 
-      if (isEnabled && pos.breakEvenStatus !== 'ARMED_L1' && rMultiple >= BE_TRIGGER_R) {
+      if (isEnabled && pos.breakEvenStatus !== 'ARMED_L1' && (favorableMovePct >= minBeCoverPct || rMultiple >= BE_TRIGGER_R)) {
         armBreakEvenOnL1ForPosition(pos);
       }
     }
-  }, [positions, isAutoBotActive, isBreakEvenShieldEnabled, armBreakEvenOnL1ForPosition]);
+  }, [positions, isAutoBotActive, isBreakEvenShieldEnabled, activeSymbol, orderBook.bids, orderBook.asks, armBreakEvenOnL1ForPosition]);
 
   const closeAllPositions = useCallback(() => {
     positions.forEach((p) => closePosition(p.id, 'MANUAL_CLOSE'));
@@ -3190,18 +3245,19 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setQuantJournal((prev) => [record, ...prev.slice(0, 119)]);
   }, []);
 
-  // Periodic Multi-Timeframe (5m, 15m, 1h, 4h) & BTC-PERP Real Candle Cache for active market
+  // Periodic Multi-Timeframe (5m, 15m, 1h, 4h) & BTC-PERP Real Candle Cache (incl. BTC 5m sweep leader)
   useEffect(() => {
     let active = true;
     const syncMtfCandles = async () => {
       try {
         const baseCoin = activeSymbol.replace('-PERP', '');
-        const [m5, m15, h1, h4, btcCd] = await Promise.all([
+        const [m5, m15, h1, h4, btcCd, btc5mCd] = await Promise.all([
           fetchLiveHyperliquidCandles(baseCoin, '5m', 48),
           fetchLiveHyperliquidCandles(baseCoin, '15m', 60),
           fetchLiveHyperliquidCandles(baseCoin, '1h', 60),
           fetchLiveHyperliquidCandles(baseCoin, '4h', 60),
           baseCoin === 'BTC' ? Promise.resolve(null) : fetchLiveHyperliquidCandles('BTC', timeframe, 45),
+          baseCoin === 'BTC' ? Promise.resolve(null) : fetchLiveHyperliquidCandles('BTC', '5m', 48),
         ]);
         if (!active) return;
         mtfSnapshotRef.current = {
@@ -3211,6 +3267,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           h1,
           h4,
           btcCandles: baseCoin === 'BTC' ? (timeframe === '1h' ? h1 : timeframe === '4h' ? h4 : m15) : btcCd,
+          btc5mCandles: baseCoin === 'BTC' ? m5 : btc5mCd,
           fetchedAt: Date.now(),
         };
       } catch {
@@ -3360,11 +3417,13 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
     try {
       const equityUsdc = Math.max(wallet.hyperliquidAccountValue || 0, wallet.balances.USDC || 0);
+      const mtfSnap = mtfSnapshotRef.current.symbol === activeSymbol ? mtfSnapshotRef.current : undefined;
       const computed = computeUnifiedQuantBrain({
         market: curMarket,
         orderBook,
         recentTrades,
         candles,
+        btcCandles: mtfSnap?.btcCandles || null,
         riskProfile,
         walletUsdcBalance: equityUsdc,
         maxMarginPct,
@@ -3375,7 +3434,6 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       });
       setUnifiedBrainMetrics(computed);
 
-      const mtfSnap = mtfSnapshotRef.current.symbol === activeSymbol ? mtfSnapshotRef.current : undefined;
       const ensemble = evaluateQuantEnsemble({
         market: curMarket,
         orderBook,
@@ -3383,6 +3441,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         candles,
         mtfCandles: mtfSnap,
         btcCandles: mtfSnap?.btcCandles || null,
+        btcSweepCandles: mtfSnap?.btc5mCandles || mtfSnap?.btcCandles || null,
         btcMarket: markets['BTC-PERP'] || null,
         timeframe,
         brainMode: botBrainMode,
@@ -3507,6 +3566,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
         const riskDist = Math.max(pos.entryPrice * 0.005, Math.abs(pos.entryPrice - existingPlan.stopLoss));
         const favorableMove = pos.side === 'LONG' ? curPx - pos.entryPrice : pos.entryPrice - curPx;
+        const favorableMovePct = pos.entryPrice > 0 ? favorableMove / pos.entryPrice : 0;
         const rMultiple = curPx > 0 && riskDist > 0 ? favorableMove / riskDist : 0;
         const nextPeakR = Math.max(existingPlan.peakR || 0, rMultiple);
         if (nextPeakR > (existingPlan.peakR || 0)) {
@@ -3527,36 +3587,55 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           ((pos.side === 'LONG' && curPx <= existingPlan.stopLoss) ||
             (pos.side === 'SHORT' && curPx >= existingPlan.stopLoss));
 
+        const spreadEstPct =
+          pos.symbol === activeSymbol && orderBook.bids[0]?.price && orderBook.asks[0]?.price
+            ? ((orderBook.asks[0].price - orderBook.bids[0].price) / orderBook.bids[0].price) * 100
+            : existingPlan.spreadAtEntryPct ?? 0.03;
+        const minBeCoverPct = Math.max(
+          BE_MIN_ADVANCE_PCT,
+          ((spreadEstPct + L1_ROUND_TRIP_COST_PCT) * BE_FEE_SPREAD_COVER_MULT) / 100
+        );
+        const effectiveBeBufferPct = Math.max(
+          BE_PRICE_BUFFER_PCT,
+          (spreadEstPct + L1_ROUND_TRIP_COST_PCT) / 100
+        );
+
         const beNetPx =
           pos.breakEvenPrice ||
           (pos.side === 'LONG'
-            ? pos.entryPrice * (1 + BE_PRICE_BUFFER_PCT)
-            : pos.entryPrice * (1 - BE_PRICE_BUFFER_PCT));
+            ? pos.entryPrice * (1 + effectiveBeBufferPct)
+            : pos.entryPrice * (1 - effectiveBeBufferPct));
         const crossedNetBe =
           pos.breakEvenStatus === 'ARMED_L1' &&
           curPx > 0 &&
           ((pos.side === 'LONG' && curPx <= beNetPx) || (pos.side === 'SHORT' && curPx >= beNetPx));
         const ageMs = Date.now() - (pos.openedAt || Date.now());
 
-        // Armar Break-Even L1 al alcanzar +1.2R (entrada + 0.15% para cubrir coste L1 0.12%)
-        if (rMultiple >= BE_TRIGGER_R && pos.breakEvenStatus !== 'ARMED_L1') {
+        // Seguro Break-Even automático: se arma en L1 en cuanto cubre spread + comisión o alcanza +1.2R
+        if ((favorableMovePct >= minBeCoverPct || rMultiple >= BE_TRIGGER_R) && pos.breakEvenStatus !== 'ARMED_L1') {
           await armBreakEvenOnL1ForPosition(pos);
         }
 
         if (singleTpMode) {
-          // Nocional < $60: Sin parciales TP1/TP2/TP3. Trailing desde +1.5R y TP único en +2.5R.
+          // Ficha chica (< $60 nocional) en margen aislado: Trailing desde +1.5R; si es Liquidity Sweep deja correr latigazo hasta +4.5R
           if (!existingPlan.trailingActive && rMultiple >= TRAILING_TRIGGER_R) {
             existingPlan.trailingActive = true;
             positionPlanRef.current[planKey] = existingPlan;
             localStorage.setItem('hl_position_plans_v1', JSON.stringify(positionPlanRef.current));
           }
+          const isSweepRunner = existingPlan.strategyId === 'LIQUIDITY_SWEEP';
+          const effectiveGivebackR =
+            isSweepRunner && nextPeakR >= SINGLE_TP_R ? TRAILING_WHIPLASH_GIVEBACK_R : TRAILING_GIVEBACK_R;
           const trailingHit =
             Boolean(existingPlan.trailingActive) &&
             nextPeakR >= TRAILING_TRIGGER_R &&
-            rMultiple <= nextPeakR - TRAILING_GIVEBACK_R &&
+            rMultiple <= nextPeakR - effectiveGivebackR &&
             rMultiple >= 0.4;
+          const runnerCeilingHit = isSweepRunner
+            ? rMultiple >= TRAILING_RUNNER_MAX_R
+            : rMultiple >= SINGLE_TP_R || reachedTp3;
 
-          if (rMultiple >= SINGLE_TP_R || reachedTp3 || trailingHit) {
+          if (runnerCeilingHit || trailingHit) {
             await closePosition(pos.id, 'TP_HIT');
             appendQuantJournal({
               symbol: pos.symbol,
@@ -3577,10 +3656,14 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
               cloid: existingPlan.cloid,
               entryWhy: trailingHit
                 ? `Trailing Stop (+${TRAILING_TRIGGER_R}R activo) ejecutado desde pico +${nextPeakR.toFixed(2)}R -> +${rMultiple.toFixed(2)}R.`
+                : isSweepRunner
+                ? `Latigazo Runner (+${TRAILING_RUNNER_MAX_R}R) capturado @ $${curPx} (+${rMultiple.toFixed(2)}R).`
                 : `TP Único (+${SINGLE_TP_R}R) ejecutado @ $${curPx} (+${rMultiple.toFixed(2)}R).`,
-              marketConditions: `Nocional < $${PARTIAL_TP_MIN_NOTIONAL_USDC}: Modo TP Único`,
+              marketConditions: `Nocional < $${PARTIAL_TP_MIN_NOTIONAL_USDC}: ${isSweepRunner ? 'Runner Aislado + Trailing' : 'Modo TP Único'}`,
               priceActionAfter: 'Objetivo completado',
-              optimalPostHocDecision: 'Sin parciales en nocional pequeño; trailing desde +1.5R',
+              optimalPostHocDecision: isSweepRunner
+                ? 'Ficha chica aislada dejó correr el latigazo con trailing ajustado'
+                : 'Sin parciales en nocional pequeño; trailing desde +1.5R',
             });
             continue;
           }
@@ -3919,17 +4002,24 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       let winningEnsemble: EnsembleDecision | null = null;
       let winningBook = orderBook;
       let winningSpreadPct = 0.03;
+      let winningAnalysisStartedAt = Date.now();
       let bestQualityScore = -9999;
 
-      const btcCandlesCached =
-        mtfSnapshotRef.current.btcCandles ||
-        (await fetchLiveHyperliquidCandles('BTC', timeframe, 45));
+      const [btcCandlesCached, btc5mCandlesCached] = await Promise.all([
+        mtfSnapshotRef.current.btcCandles
+          ? Promise.resolve(mtfSnapshotRef.current.btcCandles)
+          : fetchLiveHyperliquidCandles('BTC', timeframe, 45),
+        mtfSnapshotRef.current.btc5mCandles
+          ? Promise.resolve(mtfSnapshotRef.current.btc5mCandles)
+          : fetchLiveHyperliquidCandles('BTC', '5m', 48),
+      ]);
 
       for (const sym of candidateSymbols.slice(0, WHITELIST_PERPS.length)) {
         if (!isWhitelistedSymbol(sym)) continue;
         const candidateMkt = markets[sym];
         if (!candidateMkt || candidateMkt.price <= 0) continue;
 
+        const candidateAnalysisStartedAt = Date.now();
         let symBook = orderBook;
         let symTrades = recentTrades;
         let symCandles = candles;
@@ -3996,6 +4086,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           orderBook: symBook,
           recentTrades: symTrades,
           candles: symCandles,
+          btcCandles: btcCandlesCached,
           riskProfile,
           walletUsdcBalance: freeMargin > 0 ? freeMargin : realUsdc,
           maxMarginPct: effectiveBudgetPct,
@@ -4012,6 +4103,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           candles: symCandles,
           mtfCandles: candidateMtf,
           btcCandles: btcCandlesCached,
+          btcSweepCandles: btc5mCandlesCached || btcCandlesCached,
           btcMarket: markets['BTC-PERP'] || null,
           timeframe: WHITELIST_TIMEFRAMES.includes(timeframe as any) ? timeframe : '15m',
           brainMode: botBrainMode,
@@ -4030,19 +4122,27 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         }
 
         // Compuerta ÚNICA ESTRICTA (AND): Quant Ensemble + Cerebro EV+ + MTF completo + límite distancia SL 2.5%
+        // Excepción controlada: cuando BTC confirma barrido de liquidez + rebote en alta beta, el Cerebro EV+ acompaña el giro
+        const isConfirmedBtcSweepBetaLong =
+          ensemble.direction === 'LONG' &&
+          ensemble.selectedStrategyId === 'LIQUIDITY_SWEEP' &&
+          Boolean(ensemble.btcSweepTrigger?.reboundConfirmed) &&
+          (HIGH_BETA_PERPS as readonly string[]).includes(candidateMkt.symbol);
+
         const stopDistPctCheck =
           ensemble.entryPrice > 0 && ensemble.stopLoss > 0
             ? Math.abs(ensemble.entryPrice - ensemble.stopLoss) / ensemble.entryPrice
             : 1;
+        const brainMatchesOrSupportsSweep =
+          (brain.positiveEntryApproved && brain.action === ensemble.direction && brain.expectedValuePct > 0.15) ||
+          (isConfirmedBtcSweepBetaLong && brain.compositeScore >= 15 && brain.expectedValuePct > 0.1);
         const bothApproved =
           ensemble.direction !== 'WAIT' &&
           !ensemble.abstainedByL1Minimum &&
           ensemble.contradictionFilters.length === 0 &&
           ensemble.calibratedScore >= UNIFIED_MIN_SCORE &&
           stopDistPctCheck <= MAX_SL_DISTANCE_PCT &&
-          brain.positiveEntryApproved &&
-          brain.action === ensemble.direction &&
-          brain.expectedValuePct > 0.15;
+          brainMatchesOrSupportsSweep;
 
         if (!bothApproved || ensemble.direction === 'WAIT') continue;
         const resolvedDir: 'LONG' | 'SHORT' = ensemble.direction;
@@ -4057,8 +4157,8 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         );
         if (inLockedZone) continue;
 
-        // Bloqueo estricto por correlación BTC (>= 0.55 en misma dirección)
-        if (riskConfig.correlationBlockEnabled && positions.length >= 1) {
+        // Bloqueo estricto por correlación BTC (>= 0.55 en misma dirección), excepto disparo coordinado alta-beta tras rebote BTC
+        if (riskConfig.correlationBlockEnabled && positions.length >= 1 && !isConfirmedBtcSweepBetaLong) {
           const sameDirOpen = positions.some((p) => p.side === resolvedDir);
           if (sameDirOpen && ensemble.indicators.btcCorrelation >= 0.55) continue;
         }
@@ -4069,7 +4169,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           const prev5m = candles5m[candles5m.length - 3];
           const move10mPct = prev5m.close > 0 ? ((last5m.close - prev5m.close) / prev5m.close) * 100 : 0;
           const min5mMove = Math.max(0.04, spreadPct * 1.2);
-          const is5mBull = last5m.close > last5m.open && move10mPct >= min5mMove;
+          const is5mBull = last5m.close > last5m.open && (move10mPct >= min5mMove || isConfirmedBtcSweepBetaLong);
           const is5mBear = last5m.close < last5m.open && move10mPct <= -min5mMove;
           if ((resolvedDir === 'LONG' && !is5mBull) || (resolvedDir === 'SHORT' && !is5mBear)) {
             continue;
@@ -4078,10 +4178,12 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           continue;
         }
 
+        const highBetaSweepBonus = isConfirmedBtcSweepBetaLong ? (ensemble.betaRatioVsBtc || 1.2) * 18 : 0;
         const quality =
           ensemble.calibratedScore * 1.5 +
           (ensemble.netExpectedEvPct ?? brain.expectedValuePct) * 30 +
-          Math.abs(brain.compositeScore) * 0.4 -
+          Math.abs(brain.compositeScore) * 0.4 +
+          highBetaSweepBonus -
           spreadPct * 220;
         if (quality > bestQualityScore) {
           bestQualityScore = quality;
@@ -4090,6 +4192,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           winningEnsemble = { ...ensemble, direction: resolvedDir };
           winningBook = symBook;
           winningSpreadPct = spreadPct;
+          winningAnalysisStartedAt = candidateAnalysisStartedAt;
         }
       }
 
@@ -4223,6 +4326,88 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const baseCoin = winningMarket.symbol.replace('-PERP', '');
       const botCloid = buildBotCloid(winningEnsemble.selectedStrategyId);
 
+      // Filtro estricto de latencia por caducidad (TTL 5-10s) + guardia anti-techo en rebotes
+      const signalTtlMs = winningEnsemble.signalTtlMs || DEFAULT_SIGNAL_TTL_MS;
+      const analysisElapsedMs = Date.now() - winningAnalysisStartedAt;
+      if (analysisElapsedMs > signalTtlMs) {
+        appendQuantJournal({
+          symbol: winningMarket.symbol,
+          side: finalAction,
+          eventType: 'RISK_BLOCKED',
+          strategyId: winningEnsemble.selectedStrategyId,
+          strategyName: winningEnsemble.selectedStrategyName,
+          brainMode: botBrainMode,
+          regime: winningEnsemble.regime,
+          score: finalCalibratedScore,
+          entryPrice: topOfBookPx,
+          stopLoss: winningEnsemble.stopLoss,
+          tp1: winningEnsemble.tp1,
+          tp2: winningEnsemble.tp2,
+          tp3: winningEnsemble.tp3,
+          entryWhy: `TTL expirado (${analysisElapsedMs}ms > ${signalTtlMs}ms): señal invalidada para no comprar techo por retraso de red.`,
+          marketConditions: `Latencia análisis ${analysisElapsedMs}ms`,
+          priceActionAfter: 'Orden abortada antes de firma L1',
+          optimalPostHocDecision: 'Esperar ventana fresca < 10s',
+        });
+        setAiLogs((prev) => [
+          {
+            id: `${Date.now()}-ttl`,
+            timestamp: Date.now(),
+            type: 'RISK_CHECK',
+            symbol: winningMarket!.symbol,
+            message: `[TTL EXPIRADO · ANTI-TECHO] Señal en ${winningMarket!.symbol} invalidada por retraso (${analysisElapsedMs}ms > ${signalTtlMs}ms).`,
+          },
+          ...prev.slice(0, 49),
+        ]);
+        return;
+      }
+
+      const liveMarkNow = markets[winningMarket.symbol]?.price || topOfBookPx;
+      const tp1Dist = Math.abs((winningEnsemble.tp1 || topOfBookPx) - winningEnsemble.entryPrice);
+      const chaseDelta =
+        finalAction === 'LONG'
+          ? Math.max(0, liveMarkNow - winningEnsemble.entryPrice)
+          : Math.max(0, winningEnsemble.entryPrice - liveMarkNow);
+      const driftRatio = tp1Dist > 0 ? chaseDelta / tp1Dist : 0;
+      if (driftRatio > MAX_SIGNAL_PRICE_DRIFT_RATIO) {
+        appendQuantJournal({
+          symbol: winningMarket.symbol,
+          side: finalAction,
+          eventType: 'RISK_BLOCKED',
+          strategyId: winningEnsemble.selectedStrategyId,
+          strategyName: winningEnsemble.selectedStrategyName,
+          brainMode: botBrainMode,
+          regime: winningEnsemble.regime,
+          score: finalCalibratedScore,
+          entryPrice: liveMarkNow,
+          stopLoss: winningEnsemble.stopLoss,
+          tp1: winningEnsemble.tp1,
+          tp2: winningEnsemble.tp2,
+          tp3: winningEnsemble.tp3,
+          entryWhy: `Anti-techo rebote: precio ya recorrió ${(driftRatio * 100).toFixed(0)}% hacia TP1 ($${winningEnsemble.entryPrice} -> $${liveMarkNow}).`,
+          marketConditions: `Desviación de entrada ${(driftRatio * 100).toFixed(1)}%`,
+          priceActionAfter: 'Bloqueado para evitar perseguir el techo del primer rebote',
+          optimalPostHocDecision: 'Esperar siguiente limpieza o pullback',
+        });
+        setAiLogs((prev) => [
+          {
+            id: `${Date.now()}-drift`,
+            timestamp: Date.now(),
+            type: 'RISK_CHECK',
+            symbol: winningMarket!.symbol,
+            message: `[ANTI-TECHO REBOTE] ${winningMarket!.symbol} ya avanzó ${(driftRatio * 100).toFixed(0)}% del tramo hacia TP1. Abortando entrada tardía.`,
+          },
+          ...prev.slice(0, 49),
+        ]);
+        return;
+      }
+
+      // Ficha chica en margen aislado (pérdida estrictamente topada desde segundo uno)
+      const useIsolatedMargin =
+        winningEnsemble.isolatedMarginRecommended ??
+        (ISOLATED_SNIPER_MARGIN_DEFAULT &&
+          (deployMargin <= 25 || realUsdc < 100 || winningEnsemble.selectedStrategyId === 'LIQUIDITY_SWEEP'));
+
       const l1Res = await submitHyperliquidL1Order({
         privateKey: wallet.apiWalletKey || wallet.privateKey,
         coin: baseCoin,
@@ -4230,7 +4415,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         price: topOfBookPx,
         size,
         leverage,
-        isCross: true,
+        isCross: !useIsolatedMargin,
         slippagePct: 0,
         tif: 'Alo',
         cloid: botCloid,
@@ -4274,7 +4459,8 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const resolvedRealFillHash = await resolveFillHashByOid(effectiveMaster, l1Res.oid);
       const orderRef = resolvedRealFillHash || (l1Res.oid ? String(l1Res.oid) : undefined);
       const evDisplay = winningEnsemble.netExpectedEvPct ?? winningBrain.expectedValuePct;
-      const aiRationaleMsg = `[${winningEnsemble.selectedStrategyName} · ${winningEnsemble.regime}] Score ${finalCalibratedScore}/100 · MTF ${winningEnsemble.mtf.alignedCount}/4 · EV Neto +${evDisplay}% · ${winningEnsemble.justification}`;
+      const marginModeTag = useIsolatedMargin ? 'AISLADO' : 'CROSS';
+      const aiRationaleMsg = `[${winningEnsemble.selectedStrategyName} · ${winningEnsemble.regime} · ${marginModeTag}] Score ${finalCalibratedScore}/100 · MTF ${winningEnsemble.mtf.alignedCount}/4 · EV Neto +${evDisplay}% · ${winningEnsemble.justification}`;
 
       if (isMevShieldActive) {
         const orderNotional = +(size * topOfBookPx).toFixed(2);
@@ -4285,7 +4471,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
             id: `mev-bot-${nowTs}`,
             timestamp: nowTs,
             type: 'PERP_SETTLEMENT',
-            description: `Bot Alo Maker ${finalAction} ${winningMarket!.symbol} ($${orderNotional})`,
+            description: `Bot Alo Maker ${marginModeTag} ${finalAction} ${winningMarket!.symbol} ($${orderNotional})`,
             txHash: orderRef || 'L1-ALO',
             route: 'Hyperliquid Zero-Mempool L1',
             mevSavedUsdc: makerRebateEst,
@@ -4295,7 +4481,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         ]);
       }
 
-      // Save TP / Single-TP vs Partial Plan + deterministic cloid metadata
+      // Save TP / Single-TP vs Partial Plan + deterministic cloid metadata + isolated flag
       const planKey = `${winningMarket.symbol}-${finalAction}`;
       const isSingleTp = notional < PARTIAL_TP_MIN_NOTIONAL_USDC;
       positionPlanRef.current[planKey] = {
@@ -4316,6 +4502,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         score: finalCalibratedScore,
         expectedEvPct: evDisplay,
         spreadAtEntryPct: +winningSpreadPct.toFixed(4),
+        isIsolated: useIsolatedMargin,
       };
       localStorage.setItem('hl_position_plans_v1', JSON.stringify(positionPlanRef.current));
 
@@ -4342,6 +4529,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           score: finalCalibratedScore,
           expectedEvPct: evDisplay,
           spreadAtEntryPct: +winningSpreadPct.toFixed(4),
+          isIsolated: useIsolatedMargin,
         },
       };
       localStorage.setItem('hl_ai_active_entries_v3', JSON.stringify(aiActiveEntriesRef.current));
@@ -4362,11 +4550,11 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         tp3: winningEnsemble.tp3,
         cloid: botCloid,
         entryWhy: winningEnsemble.justification,
-        marketConditions: `RSI ${winningEnsemble.indicators.rsi14} · ATR ${winningEnsemble.indicators.atrPct}% · Spread ${winningSpreadPct.toFixed(3)}% · Coste L1 ${winningEnsemble.estimatedRoundTripCostPct ?? 0.12}%`,
+        marketConditions: `Margen ${marginModeTag} · RSI ${winningEnsemble.indicators.rsi14} · ATR ${winningEnsemble.indicators.atrPct}% · Spread ${winningSpreadPct.toFixed(3)}% · TTL ${analysisElapsedMs}/${signalTtlMs}ms`,
         priceActionAfter: Boolean(firstStatus?.resting) ? 'Orden Maker Post-Only descansando en L1' : 'Ejecución llena en L1',
         optimalPostHocDecision: isSingleTp
-          ? `Plan Nocional $${notional.toFixed(2)}: BE +${BE_TRIGGER_R}R (+0.15%) -> Trail +${TRAILING_TRIGGER_R}R -> TP Único $${winningEnsemble.tp3} (+${SINGLE_TP_R}R)`
-          : `Plan: TP1 $${winningEnsemble.tp1} -> BE (+0.15%) -> TP2 $${winningEnsemble.tp2} -> TP3 $${winningEnsemble.tp3}`,
+          ? `Plan ${marginModeTag} $${notional.toFixed(2)}: BE auto spread+fees -> Trail +${TRAILING_TRIGGER_R}R -> TP $${winningEnsemble.tp3}`
+          : `Plan ${marginModeTag}: TP1 $${winningEnsemble.tp1} -> BE -> TP2 $${winningEnsemble.tp2} -> TP3 $${winningEnsemble.tp3}`,
       });
 
       const isResting = Boolean(firstStatus?.resting);
@@ -4377,8 +4565,8 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           type: 'EXECUTION',
           symbol: winningMarket!.symbol,
           message: isResting
-            ? `[MAKER ALO · ${winningEnsemble!.selectedStrategyName}] ${finalAction} ${winningMarket!.symbol} @ $${topOfBookPx} ($${notional.toFixed(2)} a ${leverage}x · Score ${finalCalibratedScore}/100 · EV Neto +${evDisplay}% · OID ${l1Res.oid || 'OK'}).`
-            : `[EJECUCIÓN LIVE L1 · ${winningEnsemble!.selectedStrategyName}] ${finalAction} ${winningMarket!.symbol} · OID ${l1Res.oid || 'OK'} ($${notional.toFixed(2)} a ${leverage}x).`,
+            ? `[MAKER ALO ${marginModeTag} · ${winningEnsemble!.selectedStrategyName}] ${finalAction} ${winningMarket!.symbol} @ $${topOfBookPx} ($${notional.toFixed(2)} a ${leverage}x · Score ${finalCalibratedScore}/100 · EV Neto +${evDisplay}% · OID ${l1Res.oid || 'OK'}).`
+            : `[EJECUCIÓN LIVE L1 ${marginModeTag} · ${winningEnsemble!.selectedStrategyName}] ${finalAction} ${winningMarket!.symbol} · OID ${l1Res.oid || 'OK'} ($${notional.toFixed(2)} a ${leverage}x).`,
           details: { txHash: orderRef, oid: l1Res.oid },
         },
         ...prev.slice(0, 49),
@@ -4387,9 +4575,9 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
       addToast({
         type: 'success',
         title: isResting
-          ? `Maker L1 (${winningEnsemble.selectedStrategyName}): ${finalAction} ${winningMarket.symbol}`
-          : `Ejecutado L1: ${finalAction} ${winningMarket.symbol}`,
-        message: `Precio $${topOfBookPx} | $${notional.toFixed(2)} (${leverage}x) | EV Neto +${evDisplay}% | SL $${winningEnsemble.stopLoss}`,
+          ? `Maker ${marginModeTag} L1 (${winningEnsemble.selectedStrategyName}): ${finalAction} ${winningMarket.symbol}`
+          : `Ejecutado ${marginModeTag} L1: ${finalAction} ${winningMarket.symbol}`,
+        message: `Precio $${topOfBookPx} | $${notional.toFixed(2)} (${leverage}x ${marginModeTag}) | EV Neto +${evDisplay}% | SL $${winningEnsemble.stopLoss}`,
       });
       await refreshRealBalances();
     } finally {
@@ -4494,16 +4682,27 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
           userTrades: closedTrades.filter((t) => t.openedBy === 'MANUAL'),
           botTrades: closedTrades.filter((t) => t.openedBy === 'AI_BOT'),
           customTopic: effectiveTopic,
+          hasResearchReports: researchReports.length > 0,
         });
         hasRemoteGuideRef.current = true;
         setGuideAnalysis(result);
         setLastGuideScanAt(Date.now());
         if (!opts?.silent) {
-          addToast({
-            type: 'success',
-            title: 'Guía de Internet ON y Sincronizada',
-            message: `${result.title} (${result.internetWisdom?.sentimentScore ?? 50}% consenso) escaneando junto con el Terminal.`,
-          });
+          if (result.quotaExhausted) {
+            addToast({
+              type: 'warning',
+              title: 'Guía en Modo Cuántico Local',
+              message:
+                result.quotaNotice ||
+                'Cuota de Gemini en enfriamiento. Configura una API key con facturación en Settings > Secrets para análisis web en vivo.',
+            });
+          } else {
+            addToast({
+              type: 'success',
+              title: 'Guía de Internet ON y Sincronizada',
+              message: `${result.title} (${result.internetWisdom?.sentimentScore ?? 50}% consenso) escaneando junto con el Terminal.`,
+            });
+          }
         }
       } catch (err: any) {
         if (!opts?.silent) {
@@ -4518,7 +4717,7 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
         setIsAnalyzingGuide(false);
       }
     },
-    [activeSymbol, markets, orderBook.spread, closedTrades, guideScanTopic, addToast]
+    [activeSymbol, markets, orderBook.spread, closedTrades, guideScanTopic, researchReports.length, addToast]
   );
 
   const toggleGuideLiveScan = useCallback(() => {
@@ -4550,18 +4749,19 @@ export const TradingProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
   }, [fetchCommunityGuide, guideScanTopic]);
 
-  // Persistent background scanner for Internet Guide across ALL tabs (runs every 20 min while ON)
+  const isActiveGuideMarketReady = (markets[activeSymbol]?.price || 0) > 0;
+
+  // Persistent background scanner for Internet Guide across ALL tabs (runs every 20 min while ON; never churns on price ticks)
   useEffect(() => {
-    if (!isGuideLiveScanActive) return;
-    const priceReady = (markets[activeSymbol]?.price || 0) > 0;
-    if (priceReady && (!lastGuideScanAt || Date.now() - lastGuideScanAt >= GUIDE_BG_SCAN_INTERVAL_MS)) {
+    if (!isGuideLiveScanActive || !isActiveGuideMarketReady) return;
+    if (!lastGuideScanAt || Date.now() - lastGuideScanAt >= GUIDE_BG_SCAN_INTERVAL_MS) {
       guideTickRef.current();
     }
     const interval = setInterval(() => {
       guideTickRef.current();
     }, GUIDE_BG_SCAN_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [isGuideLiveScanActive, activeSymbol, markets, lastGuideScanAt]);
+  }, [isGuideLiveScanActive, activeSymbol, isActiveGuideMarketReady, lastGuideScanAt]);
 
   return (
     <TradingContext.Provider

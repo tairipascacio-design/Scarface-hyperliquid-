@@ -273,6 +273,21 @@ export const KnowledgeBaseTab: React.FC = () => {
           {/* Guide Content Display */}
           {guideAnalysis ? (
             <div className="space-y-5">
+              {guideAnalysis.quotaExhausted && (
+                <div className="rounded-xl bg-amber-950/60 border border-amber-500/40 px-4 py-3 flex items-start gap-3 text-xs text-amber-200 font-sans">
+                  <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold uppercase tracking-wide text-amber-300 block">
+                      Modo Cuántico L1 Activo (Cuota Gemini en Enfriamiento)
+                    </span>
+                    <span className="text-amber-100/90">
+                      {guideAnalysis.quotaNotice ||
+                        'La cuota gratuita de Gemini API se agotó temporalmente (429 RESOURCE_EXHAUSTED). El bot sigue operando con análisis determinístico L1. Puedes seleccionar una API key con facturación en Settings > Secrets para consultas web ilimitadas.'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
               {/* Veredicto Supremo de Tony Montana Card */}
               <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#170e0a] via-[#24130a] to-[#120704] border-2 border-amber-400 p-6 shadow-2xl">
                 <div className="flex items-start justify-between gap-4">

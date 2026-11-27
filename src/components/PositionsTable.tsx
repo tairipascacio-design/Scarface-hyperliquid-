@@ -228,15 +228,25 @@ export const PositionsTable: React.FC = () => {
                       </td>
 
                       <td className="py-3 px-3">
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-                            isLong
-                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                              : 'bg-red-950 text-red-400 border border-red-800'
-                          }`}
-                        >
-                          {pos.side} {pos.leverage}x
-                        </span>
+                        <div className="flex items-center gap-1">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
+                              isLong
+                                ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                                : 'bg-red-950 text-red-400 border border-red-800'
+                            }`}
+                          >
+                            {pos.side} {pos.leverage}x
+                          </span>
+                          {pos.isIsolated && (
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-cyan-950/70 text-cyan-300 border border-cyan-700/70"
+                              title="Margen Aislado: pérdida máxima topada desde el segundo uno"
+                            >
+                              AISLADO
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       <td className="py-3 px-3 text-zinc-300 font-bold">{pos.size}</td>
@@ -268,7 +278,7 @@ export const PositionsTable: React.FC = () => {
                           </button>
                         ) : (
                           <div className="flex items-center gap-1.5">
-                            {pos.unrealizedPnlPercent >= 0.5 ? (
+                            {pos.unrealizedPnlPercent >= 0.35 ? (
                               <button
                                 type="button"
                                 onClick={() => togglePositionBreakEven(pos.id, true)}

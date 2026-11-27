@@ -13,6 +13,7 @@ import {
 import {
   CVD_WINDOW_MAX_MS,
   CVD_WINDOW_MIN_MS,
+  HIGH_BETA_COINS,
   L1_ROUND_TRIP_COST_PCT,
   MAX_GLOBAL_LEVERAGE,
   MAX_SL_DISTANCE_PCT,
@@ -26,12 +27,14 @@ import {
   computeControlledPositionSizing,
   isWhitelistedSymbol,
 } from './riskConstants';
+import { classifyVolatilitySubRegime, computeBetaVsBtc } from './quantEngine';
 
 interface BrainInputParams {
   market: MarketData;
   orderBook: { bids: OrderBookEntry[]; asks: OrderBookEntry[]; spread: number; midPrice: number };
   recentTrades: RecentTrade[];
   candles: Candle[];
+  btcCandles?: Candle[] | null;
   riskProfile: 'Conservative' | 'Balanced' | 'Aggressive';
   walletUsdcBalance: number;
   maxMarginPct: number;
@@ -203,6 +206,7 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
     orderBook,
     recentTrades,
     candles,
+    btcCandles = null,
     riskProfile,
     walletUsdcBalance,
     maxMarginPct,
@@ -446,6 +450,25 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
 
   const effectiveScoreFloor = Math.max(UNIFIED_MIN_SCORE, optimizer.minScoreThreshold);
 
+  // Régimen de volatilidad granular: volumen institucional, pánico por noticias o rango estrecho
+  const volLookback = candles.slice(-21, -1);
+  const avgVol20 = volLookback.reduce((acc, c) => acc + (c.volume || 1), 0) / Math.max(1, volLookback.length);
+  const volRatio = lastCandle && avgVol20 > 0 ? (lastCandle.volume || 0) / avgVol20 : 1.0;
+  const curRangePct =
+    lastCandle && lastCandle.close > 0 ? ((lastCandle.high - lastCandle.low) / lastCandle.close) * 100 : atrPct;
+  const avgRangePct =
+    volLookback.reduce((acc, c) => acc + (c.close > 0 ? ((c.high - c.low) / c.close) * 100 : atrPct), 0) /
+    Math.max(1, volLookback.length);
+  const { volatilitySubRegime, executionPosture } = classifyVolatilitySubRegime({
+    atrPct,
+    volRatio,
+    curRangePct,
+    avgRangePct,
+    liveSpreadPct,
+    cvdMomentumPct,
+  });
+  void computeBetaVsBtc(candles, btcCandles, atrPct, market.symbol);
+
   if (inCooldown || spreadTooWide || slTooWide || !tpCoversFourXCost) {
     verdict = 'NEUTRAL_WAIT';
     action = 'WAIT';
@@ -454,6 +477,17 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
     verdict = 'DELTA_NEUTRAL_ARBITRAGE';
     action = 'DELTA_NEUTRAL';
     positiveEntryApproved = true;
+  } else if (executionPosture === 'STAY_QUIET') {
+    verdict = 'NEUTRAL_WAIT';
+    action = 'WAIT';
+    positiveEntryApproved = false;
+  } else if (
+    executionPosture === 'WAIT_CONFIRMATION' &&
+    (alignedPillars < UNIFIED_TOTAL_PILLARS || Math.abs(compositeScore) < Math.max(76, effectiveScoreFloor + 10))
+  ) {
+    verdict = 'NEUTRAL_WAIT';
+    action = 'WAIT';
+    positiveEntryApproved = false;
   } else if (
     compositeScore >= Math.max(76, effectiveScoreFloor + 10) &&
     bullPillars >= UNIFIED_MIN_PILLARS &&
@@ -544,6 +578,10 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
     rationale = `Distancia TP (${(tpDistPct * 100).toFixed(2)}%) no cubre 4x coste ida/vuelta (0.48%). Bloqueado.`;
   } else if (spreadTooWide) {
     rationale = `Spread L2 demasiado alto (${liveSpreadPct.toFixed(3)}%). Optimizador bloquea entrada.`;
+  } else if (executionPosture === 'STAY_QUIET' && action === 'WAIT') {
+    rationale = `Rango estrecho (ATR ${atrPct.toFixed(2)}%, Vol ${volRatio.toFixed(2)}x): quieto sin regalar comisiones L1.`;
+  } else if (executionPosture === 'WAIT_CONFIRMATION' && action === 'WAIT') {
+    rationale = `Pánico/volatilidad extrema (ATR ${atrPct.toFixed(2)}%): esperando confirmación completa (${alignedPillars}/4 pilares).`;
   } else if (action === 'DELTA_NEUTRAL') {
     rationale = `Estrategia Maestra EV+: Funding +${(fundingRate * 100).toFixed(4)}%/8h (${fundingRateApy}% APY). Cobertura Delta-0.${vaultBoostNote}`;
   } else if (action === 'LONG') {
@@ -567,7 +605,7 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
       ? 'ARBITRAJE DELTA-0'
       : 'ESPERAR SETUP LIMPIO';
 
-  const tonyActionableSynthesis = `OPTIMIZADOR TONY [${optimizer.modeLabel}]: ${market.symbol} a $${currentPrice.toFixed(priceDecimals)} | Score: ${compositeScore > 0 ? '+' : ''}${compositeScore}/100 | Pilares: ${alignedPillars}/${UNIFIED_TOTAL_PILLARS} | EV+ Neto: ${expectedValuePct > 0 ? '+' : ''}${expectedValuePct}% (R:R ${riskRewardRatio}:1). Acción: ${actionText} (${suggestedLeverage}x). TP: $${takeProfitPrice} | SL: $${stopLossPrice}. ${rationale}`;
+  const tonyActionableSynthesis = `OPTIMIZADOR TONY [${optimizer.modeLabel} · ${volatilitySubRegime}]: ${market.symbol} a $${currentPrice.toFixed(priceDecimals)} | Score: ${compositeScore > 0 ? '+' : ''}${compositeScore}/100 | Pilares: ${alignedPillars}/${UNIFIED_TOTAL_PILLARS} | EV+ Neto: ${expectedValuePct > 0 ? '+' : ''}${expectedValuePct}% (R:R ${riskRewardRatio}:1). Acción: ${actionText} (${suggestedLeverage}x). TP: $${takeProfitPrice} | SL: $${stopLossPrice}. ${rationale}`;
 
   return {
     compositeScore,
@@ -605,12 +643,14 @@ export function computeUnifiedQuantBrain(params: BrainInputParams): UnifiedBrain
     optimizer,
     isStatisticallyCalibrated,
     roundTripCostPct: totalRoundTripCostPct,
+    volatilitySubRegime,
+    executionPosture,
     calculatedAt: Date.now(),
   };
 }
 
 /**
- * SCANNER DE RADAR WHITELIST FIJA (4 PARES LÍQUIDOS: BTC, ETH, SOL, HYPE)
+ * SCANNER DE RADAR WHITELIST FIJA (BTC, ETH, SOL, HYPE, ZEC — incluyendo alta beta)
  */
 export function scanAllHyperliquidMarkets(
   markets: Record<string, MarketData>,
@@ -620,10 +660,16 @@ export function scanAllHyperliquidMarkets(
   const now = Date.now();
   const optimizer = computeAdaptiveOptimizer(closedTrades, riskProfile, 0.03);
   const opportunities: MarketScanOpportunity[] = [];
+  const btcMkt = markets['BTC-PERP'];
+  const btcRangePct =
+    btcMkt && btcMkt.price > 0 && btcMkt.high24h > btcMkt.low24h
+      ? ((btcMkt.high24h - btcMkt.low24h) / btcMkt.price) * 100
+      : Math.abs(btcMkt?.change24h || 0);
+  const btcVolProxy = Math.max(0.8, Math.abs(btcMkt?.change24h || 0), btcRangePct);
 
   for (const m of Object.values(markets)) {
     if (!m || !m.price || m.price <= 0) continue;
-    // Whitelist fija de 4 pares líquidos (BTC, ETH, SOL, HYPE) — elimina escaneo de 801 tokens
+    // Whitelist fija de pares líquidos (BTC, ETH, SOL, HYPE, ZEC)
     if (!isWhitelistedSymbol(m.symbol)) continue;
 
     const coin = m.symbol.replace('-PERP', '');
@@ -633,6 +679,23 @@ export function scanAllHyperliquidMarkets(
     const premiumPct = +((m.premium || 0) * 100).toFixed(3);
     const volToOi = m.openInterest > 0 ? m.volume24h / m.openInterest : 1;
     const inCooldown = optimizer.cooldownSymbols.includes(m.symbol);
+
+    const symRangePct =
+      m.price > 0 && m.high24h > m.low24h ? ((m.high24h - m.low24h) / m.price) * 100 : Math.abs(change24h);
+    const isHighBetaCoin = (HIGH_BETA_COINS as readonly string[]).includes(coin);
+    const betaVsBtc =
+      m.symbol === 'BTC-PERP'
+        ? 1.0
+        : +Math.max(isHighBetaCoin ? 1.15 : 0.75, Math.min(2.8, Math.max(Math.abs(change24h), symRangePct) / btcVolProxy)).toFixed(2);
+
+    const scanSubRegime =
+      symRangePct >= 10 || Math.abs(change24h) >= 12
+        ? 'NEWS_PANIC'
+        : symRangePct < 1.2 && Math.abs(change24h) < 0.8 && volToOi < 0.9
+        ? 'TIGHT_RANGE'
+        : volToOi >= 1.25 && m.volume24h >= 40_000_000
+        ? 'INSTITUTIONAL_VOLUME'
+        : 'NORMAL_FLOW';
 
     // 1. Score por Funding & Squeeze
     let fScore = 0;
@@ -696,6 +759,8 @@ export function scanAllHyperliquidMarkets(
 
     if (inCooldown) {
       reason = 'Cooldown anti-racha activo (pérdida reciente)';
+    } else if (scanSubRegime === 'TIGHT_RANGE') {
+      reason = 'Rango estrecho sin volumen: quieto para no regalar comisiones L1';
     } else if (fundingRate >= 0.00028 && fundingApy >= 30 && Math.abs(momScore) <= 12) {
       action = 'DELTA_NEUTRAL';
       positiveEntryApproved = true;
@@ -703,11 +768,11 @@ export function scanAllHyperliquidMarkets(
     } else if (score >= scanThreshold && !isFomoOverbought && expectedValuePct > 0.20) {
       action = 'LONG';
       positiveEntryApproved = true;
-      reason = `Impulso alcista L1 (${change24h >= 0 ? '+' : ''}${change24h}%), Basis ${premiumPct >= 0 ? '+' : ''}${premiumPct}% y Vol $${(m.volume24h / 1e6).toFixed(1)}M`;
+      reason = `Impulso alcista L1 (${change24h >= 0 ? '+' : ''}${change24h}% · Beta ${betaVsBtc}x), Basis ${premiumPct >= 0 ? '+' : ''}${premiumPct}% y Vol $${(m.volume24h / 1e6).toFixed(1)}M`;
     } else if (score <= -scanThreshold && !isOversoldCrash && expectedValuePct > 0.20) {
       action = 'SHORT';
       positiveEntryApproved = true;
-      reason = `Presión bajista L1 (${change24h}%), Basis ${premiumPct}% y Vol $${(m.volume24h / 1e6).toFixed(1)}M`;
+      reason = `Presión bajista L1 (${change24h}% · Beta ${betaVsBtc}x), Basis ${premiumPct}% y Vol $${(m.volume24h / 1e6).toFixed(1)}M`;
     } else {
       reason = isFomoOverbought
         ? `Guardia Anti-FOMO (+${change24h}% extendido)`
@@ -737,6 +802,8 @@ export function scanAllHyperliquidMarkets(
       positiveEntryApproved,
       reason,
       scannedAt: now,
+      betaVsBtc,
+      volatilitySubRegime: scanSubRegime,
     });
   }
 
@@ -744,8 +811,10 @@ export function scanAllHyperliquidMarkets(
     if (a.positiveEntryApproved !== b.positiveEntryApproved) {
       return a.positiveEntryApproved ? -1 : 1;
     }
-    const rankA = a.expectedValuePct * a.confidence + Math.log10(Math.max(1, a.volume24h)) * 4;
-    const rankB = b.expectedValuePct * b.confidence + Math.log10(Math.max(1, b.volume24h)) * 4;
+    const betaBonusA = a.action === 'LONG' || a.action === 'SHORT' ? (a.betaVsBtc || 1) * 6 : 0;
+    const betaBonusB = b.action === 'LONG' || b.action === 'SHORT' ? (b.betaVsBtc || 1) * 6 : 0;
+    const rankA = a.expectedValuePct * a.confidence + Math.log10(Math.max(1, a.volume24h)) * 4 + betaBonusA;
+    const rankB = b.expectedValuePct * b.confidence + Math.log10(Math.max(1, b.volume24h)) * 4 + betaBonusB;
     return rankB - rankA;
   });
 }

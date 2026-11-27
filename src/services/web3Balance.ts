@@ -1,7 +1,7 @@
 import { privateKeyToAccount } from 'viem/accounts';
 import { keccak256, hexToBytes } from 'viem';
 import { encode as msgpackEncode } from '@msgpack/msgpack';
-import { isStandaloneApkRuntime } from './api';
+import { isStandaloneApkRuntime, getApiBaseUrl, postHyperliquidInfo } from './api';
 import { SpotTokenBalance, HashVerificationRecord } from '../types/trading';
 import { isValidTxHash, extractOidNumber } from './walletCrypto';
 import { MAX_GLOBAL_LEVERAGE } from './riskConstants';
@@ -76,25 +76,8 @@ async function callArbitrumRpc(method: string, params: any[]): Promise<string | 
 }
 
 async function callHyperliquidInfo(payload: any): Promise<any | null> {
-  if (!isStandaloneApkRuntime()) {
-    try {
-      const res = await fetch('/api/hyperliquid/info', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) return await res.json();
-    } catch {
-      // Fallback to direct L1 below
-    }
-  }
-
   try {
-    const res = await fetch('https://api.hyperliquid.xyz/info', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const res = await postHyperliquidInfo(payload, 3500);
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -362,28 +345,44 @@ async function postSignedHyperliquidAction(params: {
     ...(hasVault ? { vaultAddress: params.vaultAddress } : {}),
   });
 
+  const exchangeRoutes: Array<{ id: string; url: string }> = isStandaloneApkRuntime()
+    ? [
+        { id: 'direct-exchange', url: 'https://api.hyperliquid.xyz/exchange' },
+        ...(getApiBaseUrl() ? [{ id: 'apk-proxy-exchange', url: `${getApiBaseUrl()}/api/hyperliquid/exchange` }] : []),
+      ]
+    : [
+        { id: 'proxy-exchange', url: '/api/hyperliquid/exchange' },
+        { id: 'direct-exchange', url: 'https://api.hyperliquid.xyz/exchange' },
+      ];
+
   let exRes: Response | null = null;
-  if (!isStandaloneApkRuntime()) {
+  let lastExErr: any = null;
+
+  for (const route of exchangeRoutes) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
-      const proxyRes = await fetch('/api/hyperliquid/exchange', {
+      const res = await fetch(route.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: exchangePayload,
+        signal: controller.signal,
       });
-      if (proxyRes.status !== 404) {
-        exRes = proxyRes;
+      clearTimeout(timer);
+      if (res.status === 404 || res.status === 429 || res.status >= 502) {
+        exRes = res;
+        continue;
       }
-    } catch {
-      // Fallback directly to Hyperliquid L1 exchange gateway
+      exRes = res;
+      break;
+    } catch (err: any) {
+      clearTimeout(timer);
+      lastExErr = err;
     }
   }
 
   if (!exRes) {
-    exRes = await fetch('https://api.hyperliquid.xyz/exchange', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: exchangePayload,
-    });
+    throw lastExErr || new Error('All Hyperliquid exchange execution routes timed out');
   }
 
   const data = await exRes.json().catch(() => ({}));

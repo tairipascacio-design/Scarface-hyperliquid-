@@ -503,6 +503,7 @@ export function buildCompiledClassesDex(appUrl: string): Buffer {
     'setAllowFileAccess',
     'setAllowFileAccessFromFileURLs',
     'setAllowUniversalAccessFromFileURLs',
+    'setContentView',
     'setDatabaseEnabled',
     'setDomStorageEnabled',
     'setJavaScriptEnabled',

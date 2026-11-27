@@ -29,31 +29,120 @@ export function getApiBaseUrl(): string {
 
 const HL_DIRECT_INFO_URL = 'https://api.hyperliquid.xyz/info';
 
-async function postHyperliquidInfo(payload: any): Promise<Response> {
+interface RouteHealthEntry {
+  id: string;
+  url: string;
+  cooldownUntil: number;
+  lastLatencyMs: number;
+  failures: number;
+  successes: number;
+}
+
+const routeHealthMap: Record<string, RouteHealthEntry> = {};
+let activeInfoRouteId = 'proxy-info';
+let routeFailoverCount = 0;
+
+function getOrderedInfoRoutes(): Array<{ id: string; url: string }> {
+  const apiBase = getApiBaseUrl();
   if (isStandaloneApkRuntime()) {
-    return fetch(HL_DIRECT_INFO_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const routes: Array<{ id: string; url: string }> = [{ id: 'direct-l1', url: HL_DIRECT_INFO_URL }];
+    if (apiBase) {
+      routes.push({ id: 'apk-proxy-info', url: `${apiBase}/api/hyperliquid/info` });
+    }
+    return routes;
   }
+  return [
+    { id: 'proxy-info', url: '/api/hyperliquid/info' },
+    { id: 'direct-l1', url: HL_DIRECT_INFO_URL },
+  ];
+}
 
-  try {
-    const proxyRes = await fetch('/api/hyperliquid/info', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (proxyRes.ok) return proxyRes;
-  } catch {
-    // Fallback directly to Hyperliquid L1 API
-  }
+export function getHyperliquidRouteTelemetry() {
+  return {
+    activeInfoRouteId,
+    routeFailoverCount,
+    routes: Object.values(routeHealthMap).map((r) => ({
+      id: r.id,
+      lastLatencyMs: r.lastLatencyMs,
+      coolingDown: Date.now() < r.cooldownUntil,
+      failures: r.failures,
+      successes: r.successes,
+    })),
+  };
+}
 
-  return fetch(HL_DIRECT_INFO_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+export async function postHyperliquidInfo(payload: any, timeoutMs: number = 3200): Promise<Response> {
+  const now = Date.now();
+  const candidates = getOrderedInfoRoutes();
+  // Try healthy routes first, then fallback to cooling routes so we never stay blind
+  const sorted = [...candidates].sort((a, b) => {
+    const ha = routeHealthMap[a.id];
+    const hb = routeHealthMap[b.id];
+    const aCooling = ha && now < ha.cooldownUntil ? 1 : 0;
+    const bCooling = hb && now < hb.cooldownUntil ? 1 : 0;
+    if (aCooling !== bCooling) return aCooling - bCooling;
+    return (ha?.lastLatencyMs || 0) - (hb?.lastLatencyMs || 0);
   });
+
+  let lastResponse: Response | null = null;
+  let lastError: any = null;
+
+  for (let i = 0; i < sorted.length; i++) {
+    const route = sorted[i];
+    if (!routeHealthMap[route.id]) {
+      routeHealthMap[route.id] = {
+        id: route.id,
+        url: route.url,
+        cooldownUntil: 0,
+        lastLatencyMs: 120,
+        failures: 0,
+        successes: 0,
+      };
+    }
+    const health = routeHealthMap[route.id];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const t0 = performance.now();
+
+    try {
+      const res = await fetch(route.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      const elapsed = Math.max(1, Math.round(performance.now() - t0));
+      if (res.ok) {
+        health.lastLatencyMs = Math.round(health.lastLatencyMs * 0.6 + elapsed * 0.4);
+        health.cooldownUntil = 0;
+        health.successes += 1;
+        if (activeInfoRouteId !== route.id) {
+          routeFailoverCount += 1;
+          activeInfoRouteId = route.id;
+        }
+        return res;
+      }
+
+      // On rate limit (429) or gateway error (5xx), cool down this route and fail over
+      lastResponse = res;
+      if (res.status === 429 || res.status >= 500 || res.status === 404) {
+        health.failures += 1;
+        health.cooldownUntil = Date.now() + (res.status === 429 ? 25_000 : 12_000);
+        continue;
+      }
+      return res;
+    } catch (err: any) {
+      clearTimeout(timer);
+      lastError = err;
+      health.failures += 1;
+      health.cooldownUntil = Date.now() + 12_000;
+    }
+  }
+
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error('All Hyperliquid info routes failed');
 }
 
 function buildStandaloneTonyChat(messages: ChatMessage[], marketContext?: any): ChatResponse {
@@ -204,10 +293,15 @@ export async function requestAITradeLearning(trade: any): Promise<{
   };
 }
 
+let ttsQuotaCooldownUntil = 0;
+
 export async function requestTextToSpeech(text: string, voice: string = 'Kore'): Promise<string> {
   const apiBase = getApiBaseUrl();
   if (isStandaloneApkRuntime() && !apiBase) {
     throw new Error('APK_NATIVE_TTS');
+  }
+  if (Date.now() < ttsQuotaCooldownUntil) {
+    throw new Error('TTS_QUOTA_COOLDOWN');
   }
 
   const controller = new AbortController();
@@ -221,6 +315,11 @@ export async function requestTextToSpeech(text: string, voice: string = 'Kore'):
     });
 
     if (!response.ok) {
+      if (response.status === 429) {
+        const errData = await response.json().catch(() => ({}));
+        const retrySec = Number(errData?.retryAfterSec || 120);
+        ttsQuotaCooldownUntil = Date.now() + Math.max(60_000, Math.min(300_000, retrySec * 1000));
+      }
       throw new Error('TTS indisponible temporalmente');
     }
 
@@ -267,6 +366,10 @@ export async function requestGuideAnalysis(payload: {
   suggestedAction?: 'LONG' | 'SHORT' | 'WAIT_PULLBACK';
   suggestedLeverage?: number;
   sources?: { title: string; url: string }[];
+  source?: string;
+  quotaExhausted?: boolean;
+  retryAfterSec?: number;
+  quotaNotice?: string;
 }> {
   if (!isStandaloneApkRuntime()) {
     try {
@@ -287,8 +390,8 @@ export async function requestGuideAnalysis(payload: {
           },
         };
       }
-    } catch (err) {
-      console.warn('Network error during guide analysis:', err);
+    } catch {
+      // Fallback to deterministic local quant diagnosis below
     }
   }
 
@@ -326,7 +429,9 @@ export async function requestGuideAnalysis(payload: {
     suggestedLeverage: 3,
     sources: [
       { title: 'Hyperliquid DEX Global Liquidity Radar', url: 'https://hyperliquid.xyz' },
-    ]
+    ],
+    source: 'LOCAL_QUANT_FALLBACK',
+    quotaExhausted: false,
   };
 }
 

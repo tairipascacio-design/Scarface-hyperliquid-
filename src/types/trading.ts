@@ -36,6 +36,8 @@ export interface MarketScanOpportunity {
   positiveEntryApproved: boolean;
   reason: string;
   scannedAt: number;
+  betaVsBtc?: number;
+  volatilitySubRegime?: VolatilitySubRegime;
 }
 
 export interface Candle {
@@ -99,6 +101,7 @@ export interface Position {
   tp2Hit?: boolean;
   initialSize?: number;
   decisionScore?: number;
+  isIsolated?: boolean;
 }
 
 export interface ClosedTrade {
@@ -248,6 +251,7 @@ export interface CommunityGuideAnalysis {
     consensus: string;
     communityInsights: string[];
     sentimentScore: number;
+    weightPct?: number;
   };
   userTradesDiagnosis: {
     summary: string;
@@ -265,6 +269,10 @@ export interface CommunityGuideAnalysis {
   suggestedAction?: 'LONG' | 'SHORT' | 'WAIT_PULLBACK';
   suggestedLeverage?: number;
   sources?: { title: string; url: string }[];
+  source?: string;
+  quotaExhausted?: boolean;
+  retryAfterSec?: number;
+  quotaNotice?: string;
 }
 
 export interface FundingArbitragePosition {
@@ -368,13 +376,28 @@ export interface UnifiedBrainMetrics {
   optimizer?: OptimizerMetrics;
   isStatisticallyCalibrated?: boolean;
   roundTripCostPct?: number;
+  volatilitySubRegime?: VolatilitySubRegime;
+  executionPosture?: ExecutionPosture;
   calculatedAt: number;
 }
 
 export type BotBrainMode = 'HYBRID' | 'QUANT' | 'AI';
 export type BotExecutionMode = 'MULTI_STRATEGY' | 'CONSENSUS' | 'INDEPENDENT';
 export type MarketRegime = 'BULL_TREND' | 'BEAR_TREND' | 'RANGE_LATERAL' | 'HIGH_VOLATILITY';
+export type VolatilitySubRegime = 'INSTITUTIONAL_VOLUME' | 'NEWS_PANIC' | 'TIGHT_RANGE' | 'NORMAL_FLOW';
+export type ExecutionPosture = 'SNIPER_DIRECTIONAL' | 'WAIT_CONFIRMATION' | 'STAY_QUIET';
 export type TrendDirection = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+
+export interface BtcSweepReboundTrigger {
+  sweepDetected: boolean;
+  reboundConfirmed: boolean;
+  sweptLowPrice: number;
+  reboundStrengthPct: number;
+  absorptionWickRatio: number;
+  detectedAt: number;
+  expiresAt: number;
+  summary: string;
+}
 
 export type StrategyId =
   | 'LIQUIDITY_SWEEP'
@@ -487,6 +510,12 @@ export interface EnsembleDecision {
   skipMinNotional?: boolean;
   hasFullMtf?: boolean;
   quarantinedStrategies?: StrategyId[];
+  volatilitySubRegime?: VolatilitySubRegime;
+  executionPosture?: ExecutionPosture;
+  btcSweepTrigger?: BtcSweepReboundTrigger;
+  betaRatioVsBtc?: number;
+  signalTtlMs?: number;
+  isolatedMarginRecommended?: boolean;
   calculatedAt: number;
 }
 

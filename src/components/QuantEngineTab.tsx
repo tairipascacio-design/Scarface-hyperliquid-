@@ -305,6 +305,55 @@ export const QuantEngineTab: React.FC = () => {
             <span>
               Volume Profile POC: <strong className="text-cyan-300">{fmtPx(liveEnsemble.indicators.poc)}</strong>
             </span>
+            {liveEnsemble.volatilitySubRegime && (
+              <>
+                <span>·</span>
+                <span>
+                  Volatilidad:{' '}
+                  <strong className="text-amber-300">
+                    {liveEnsemble.volatilitySubRegime === 'INSTITUTIONAL_VOLUME'
+                      ? 'Vol. Institucional'
+                      : liveEnsemble.volatilitySubRegime === 'NEWS_PANIC'
+                      ? 'Pánico Noticias'
+                      : liveEnsemble.volatilitySubRegime === 'TIGHT_RANGE'
+                      ? 'Rango Estrecho (Quieto)'
+                      : 'Flujo Normal'}
+                  </strong>
+                </span>
+              </>
+            )}
+            {liveEnsemble.betaRatioVsBtc !== undefined && (
+              <>
+                <span>·</span>
+                <span>
+                  Beta vs BTC:{' '}
+                  <strong className="text-emerald-300">{liveEnsemble.betaRatioVsBtc}x</strong>
+                </span>
+              </>
+            )}
+            {liveEnsemble.btcSweepTrigger && (
+              <>
+                <span>·</span>
+                <span>
+                  Gatillo BTC:{' '}
+                  <strong
+                    className={
+                      liveEnsemble.btcSweepTrigger.reboundConfirmed
+                        ? 'text-emerald-400'
+                        : liveEnsemble.btcSweepTrigger.sweepDetected
+                        ? 'text-amber-300'
+                        : 'text-zinc-400'
+                    }
+                  >
+                    {liveEnsemble.btcSweepTrigger.reboundConfirmed
+                      ? 'Rebote Confirmado'
+                      : liveEnsemble.btcSweepTrigger.sweepDetected
+                      ? 'Barriendo Mínimos'
+                      : 'Sin Barrido'}
+                  </strong>
+                </span>
+              </>
+            )}
           </div>
         )}
       </section>

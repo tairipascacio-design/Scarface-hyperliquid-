@@ -1,5 +1,7 @@
-export const WHITELIST_COINS = ['BTC', 'ETH', 'SOL', 'HYPE'] as const;
-export const WHITELIST_PERPS = ['BTC-PERP', 'ETH-PERP', 'SOL-PERP', 'HYPE-PERP'] as const;
+export const WHITELIST_COINS = ['BTC', 'ETH', 'SOL', 'HYPE', 'ZEC'] as const;
+export const WHITELIST_PERPS = ['BTC-PERP', 'ETH-PERP', 'SOL-PERP', 'HYPE-PERP', 'ZEC-PERP'] as const;
+export const HIGH_BETA_COINS = ['ZEC', 'HYPE', 'SOL', 'ETH'] as const;
+export const HIGH_BETA_PERPS = ['ZEC-PERP', 'HYPE-PERP', 'SOL-PERP', 'ETH-PERP'] as const;
 export const WHITELIST_TIMEFRAMES = ['5m', '15m', '1h', '4h'] as const;
 
 export const MAX_GLOBAL_LEVERAGE = 3;
@@ -11,8 +13,10 @@ export const MIN_VIABLE_NOTIONAL_USDC = 11.5;
 export const SL_ATR_MULTIPLIER = 1.5;
 export const MAX_SL_DISTANCE_PCT = 0.025; // 2.5% max distance from entry
 
-export const BE_TRIGGER_R = 1.2; // +1.2R triggers Break-Even
-export const BE_PRICE_BUFFER_PCT = 0.0015; // entry +/- 0.15% to cover L1 round-trip cost (0.12%)
+export const BE_TRIGGER_R = 1.2; // +1.2R ceiling fallback for Break-Even
+export const BE_PRICE_BUFFER_PCT = 0.0015; // entry +/- 0.15% to cover L1 round-trip cost (0.12%) + spread
+export const BE_FEE_SPREAD_COVER_MULT = 2.0; // Triggers BE once advance >= 2.0x (spread + L1 fee)
+export const BE_MIN_ADVANCE_PCT = 0.0028; // Minimum +0.28% advance to cover spread+fee cleanly
 export const L1_ROUND_TRIP_COST_PCT = 0.12;
 export const MIN_FEE_COVERAGE_MULT = 4; // TP >= 4 * 0.12% = 0.48%
 
@@ -20,6 +24,16 @@ export const PARTIAL_TP_MIN_NOTIONAL_USDC = 60;
 export const SINGLE_TP_R = 2.5; // +2.5R single TP when notional < $60
 export const TRAILING_TRIGGER_R = 1.5; // +1.5R activates trailing stop when notional < $60
 export const TRAILING_GIVEBACK_R = 0.45;
+export const TRAILING_WHIPLASH_GIVEBACK_R = 0.3;
+export const TRAILING_RUNNER_MAX_R = 4.5; // Extended whiplash runner cap for high-beta sweep rebounds
+
+export const SIGNAL_TTL_MIN_MS = 5000;
+export const SIGNAL_TTL_MAX_MS = 10000;
+export const SWEEP_SIGNAL_TTL_MS = 7500; // 7.5s strict TTL for post-sweep liquidity bounces
+export const DEFAULT_SIGNAL_TTL_MS = 9000; // 9.0s strict TTL for directional sniper signals
+export const MAX_SIGNAL_PRICE_DRIFT_RATIO = 0.45; // Reject if price already ran >45% toward TP1
+
+export const ISOLATED_SNIPER_MARGIN_DEFAULT = true; // Use isolated margin for small-ticket / sniper entries
 
 export const MAX_TRADES_PER_DAY = 4;
 export const SL_COOLDOWN_CANDLES = 3;
